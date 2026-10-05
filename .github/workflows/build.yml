@@ -156,22 +156,33 @@ jobs:
           fi
           echo "Droidspaces 使用上游标记为 6.12-or-above 的 kABI 补丁；BBG 保持启用。"
 
-      # ==================== 清理磁盘空间 ====================
-      # GitHub Actions 默认磁盘空间有限，需要清理不必要的预装软件
+      # 定点并行清理无关的大目录，保留 swap、系统 LLVM 和其余工具缓存。
+      # 清理在当前步骤内完成，避免后台删除与后续同步、编译争用磁盘。
       - name: 清理磁盘空间
-        uses: endersonmenezes/free-disk-space@v3
-        with:
-          remove_android: true
-          remove_dotnet: true
-          remove_haskell: true
-          remove_tool_cache: true
-          remove_swap: true
-          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
-          remove_packages_one_command: true
-          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
-          rm_cmd: "rmz"
-          rmz_version: "3.1.1"
-          testing: false
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          echo "=== 清理前 ==="
+          df -h "$GITHUB_WORKSPACE"
+          free -h
+
+          cleanup_pids=()
+          for cleanup_dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/share/swift; do
+            if [ -d "$cleanup_dir" ]; then
+              echo "清理 $cleanup_dir"
+              sudo rm -rf -- "$cleanup_dir" &
+              cleanup_pids+=("$!")
+            fi
+          done
+
+          cleanup_status=0
+          for cleanup_pid in "${cleanup_pids[@]}"; do
+            wait "$cleanup_pid" || cleanup_status=1
+          done
+          echo "=== 清理后 ==="
+          df -h "$GITHUB_WORKSPACE"
+          free -h
+          exit "$cleanup_status"
 
       # ==================== 检出仓库代码 ====================
       - name: 检出代码仓库
@@ -232,25 +243,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ccache python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves
-
-      # ==================== 配置 ccache ====================
-      # ccache 用于缓存编译结果，加速后续构建
-      - name: 配置 ccache
-        run: |
-          mkdir -p ~/.cache/bazel
-          ccache --version
-          ccache --max-size=2G
-          ccache --set-config=compression=true
-          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
-
-      # ==================== 恢复 ccache 缓存 ====================
-      - name: 恢复 ccache 缓存
-        uses: actions/cache@v5
-        with:
-          path: ~/.ccache
-          key: ${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-ccache-${{ github.sha }}
-          restore-keys: |
-            ${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-ccache-
 
       # ==================== 缓存工具链 ====================
       # 缓存 AOSP 构建工具，避免每次重新下载
@@ -375,7 +367,9 @@ jobs:
           }
 
           # 克隆 GCC 工具链 (用于 5.x 内核)
-          git clone https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git gcc
+          if [ "${{ inputs.kernel_version }}" = "5.10" ] || [ "${{ inputs.kernel_version }}" = "5.15" ]; then
+            git clone --depth 1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git gcc
+          fi
 
           FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}"
           echo "初始化 repo，分支: common-${FORMATTED_BRANCH}"
@@ -426,6 +420,40 @@ jobs:
             fi
           fi
           echo "REMOTE_BRANCH=$REMOTE_BRANCH" >> $GITHUB_ENV
+
+      # 按实际构建入口选择缓存；运行编号允许同一提交持续保存新增缓存。
+      - name: 选择编译缓存
+        id: build-cache
+        run: |
+          if [ -f "$KERNEL_ROOT/build/build.sh" ]; then
+            echo "backend=ccache" >> "$GITHUB_OUTPUT"
+            echo "path=$HOME/.ccache" >> "$GITHUB_OUTPUT"
+          else
+            echo "backend=bazel" >> "$GITHUB_OUTPUT"
+            echo "path=$HOME/.cache/bazel" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 恢复编译缓存
+        id: restore-build-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ steps.build-cache.outputs.path }}
+          key: build-v2-${{ runner.os }}-${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ steps.build-cache.outputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            build-v2-${{ runner.os }}-${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ steps.build-cache.outputs.backend }}-
+            ${{ steps.build-cache.outputs.backend == 'ccache' && format('{0}-{1}-{2}-ccache-', inputs.android_version, inputs.kernel_version, inputs.sub_level) || 'legacy-bazel-cache-unavailable-' }}
+
+      - name: 配置 ccache 并重置本次统计
+        if: steps.build-cache.outputs.backend == 'ccache'
+        run: |
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          export CCACHE_DIR="$HOME/.ccache"
+          mkdir -p "$CCACHE_DIR"
+          ccache --version
+          ccache --max-size=2G
+          ccache --set-config=compression=true
+          ccache --zero-stats
 
       # ==================== 伪装 /proc/config.gz（自动检测） ====================
       # 若仓库存在 config/stock_defconfig，则自动应用；不存在则跳过
@@ -1638,6 +1666,25 @@ jobs:
             exit 1
           fi
           cp "$SRC_DIR/Image" ./Bypass-Image
+
+      - name: 报告本次 ccache 命中情况
+        if: always() && steps.build-cache.outputs.backend == 'ccache'
+        run: |
+          export CCACHE_DIR="$HOME/.ccache"
+          ccache --show-stats --verbose | tee "$RUNNER_TEMP/ccache-stats.txt"
+          {
+            echo '### 本次 ccache 统计（包含普通和 Bypass 构建）'
+            echo '```text'
+            cat "$RUNNER_TEMP/ccache-stats.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 保存编译缓存
+        if: success()
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ steps.build-cache.outputs.path }}
+          key: ${{ steps.restore-build-cache.outputs.cache-primary-key }}
 
       # ==================== 创建 AnyKernel3 压缩包 ====================
       - name: 创建 AnyKernel3 压缩包
