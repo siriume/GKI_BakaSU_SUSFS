@@ -107,6 +107,7 @@ jobs:
     # ccache 配置用于加速重复编译
     env:
       BUILD_VARIANT: ${{ inputs.clean_build && 'Clean' || inputs.ksu_variant }}
+      CCACHE_KEY: ccache-v3-gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
       CCACHE_HARDLINK: "true"
@@ -501,8 +502,9 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ steps.build-cache.outputs.path }}
-          key: build-v3-${{ runner.os }}-${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ steps.build-cache.outputs.backend }}-${{ inputs.cache_epoch }}-${{ steps.build-cache.outputs.backend == 'ccache' && steps.source-id.outputs.digest || format('{0}-{1}', github.run_id, github.run_attempt) }}
+          key: ${{ steps.build-cache.outputs.backend == 'ccache' && format('{0}-{1}-{2}-{3}', env.CCACHE_KEY, inputs.os_patch_level, inputs.cache_epoch, steps.source-id.outputs.digest) || format('build-v3-{0}-{1}-{2}-{3}-{4}-bazel-{5}-{6}-{7}', runner.os, inputs.android_version, inputs.kernel_version, inputs.sub_level, inputs.os_patch_level, inputs.cache_epoch, github.run_id, github.run_attempt) }}
           restore-keys: |
+            ${{ steps.build-cache.outputs.backend == 'ccache' && format('{0}-{1}-{2}-', env.CCACHE_KEY, inputs.os_patch_level, inputs.cache_epoch) || 'unused-ccache-key-' }}
             build-v3-${{ runner.os }}-${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ steps.build-cache.outputs.backend }}-${{ inputs.cache_epoch }}-
             ${{ inputs.cache_epoch == 'v1' && format('build-v2-{0}-{1}-{2}-{3}-{4}-{5}-', runner.os, inputs.android_version, inputs.kernel_version, inputs.sub_level, inputs.os_patch_level, steps.build-cache.outputs.backend) || 'no-legacy-cache-' }}
             ${{ inputs.cache_epoch == 'v1' && steps.build-cache.outputs.backend == 'ccache' && format('{0}-{1}-{2}-ccache-', inputs.android_version, inputs.kernel_version, inputs.sub_level) || 'legacy-bazel-cache-unavailable-' }}
