@@ -428,9 +428,9 @@ jobs:
               exit 1
             fi
           fi
-          digest=$(python3 "$GITHUB_WORKSPACE/scripts/source_snapshot.py" "$RUNNER_TEMP/source-manifest.xml" "$RUNNER_TEMP/source-locked.xml" --extra-revision "$gcc_sha")
+          digest=$(python3 "$GITHUB_WORKSPACE/scripts/source_snapshot.py" "$RUNNER_TEMP/source-manifest.xml" "$RUNNER_TEMP/source-locked.xml" --extra-revision "$gcc_sha" --sync-manifest "$RUNNER_TEMP/source-sync.xml")
           echo "gcc_sha=$gcc_sha" >> "$GITHUB_OUTPUT"
-          cp "$RUNNER_TEMP/source-locked.xml" "$DEFAULT_MANIFEST_PATH"
+          cp "$RUNNER_TEMP/source-sync.xml" "$DEFAULT_MANIFEST_PATH"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "release_tag=${RELEASE_TAG:-}" >> "$GITHUB_OUTPUT"
           echo "REMOTE_BRANCH=$REMOTE_BRANCH" >> "$GITHUB_ENV"
@@ -467,9 +467,11 @@ jobs:
             sleep $((sync_attempt * 30))
           done
 
-      - name: 验证源码子版本
+      - name: 验证源码提交和子版本
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/source_snapshot.py" "$RUNNER_TEMP/source-locked.xml" --verify-root "$KERNEL_ROOT" --extra-revision "${{ steps.source-id.outputs.gcc_sha }}"
           if [ -n "${{ steps.source-id.outputs.release_tag }}" ]; then
             ACTUAL_SUBLEVEL=$(awk '/^SUBLEVEL = / {print $3; exit}' common/Makefile)
             if [ "$ACTUAL_SUBLEVEL" != "${{ inputs.sub_level }}" ]; then
