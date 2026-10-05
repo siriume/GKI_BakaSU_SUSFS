@@ -18,6 +18,11 @@ permissions:
 on:
   workflow_call:
     inputs:
+      cache_epoch:
+        description: "缓存版本；需要刷新源码/编译缓存时改为新值，如 v2"
+        required: false
+        type: string
+        default: "v1"
       # ==================== 基础配置 ====================
       android_version:
         required: true
@@ -165,6 +170,12 @@ jobs:
           echo "=== 清理前 ==="
           df -h "$GITHUB_WORKSPACE"
           free -h
+
+          available_kib=$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')
+          if [ "$available_kib" -ge $((50 * 1024 * 1024)) ]; then
+            echo "剩余空间至少 50 GiB，跳过目录清理。"
+            exit 0
+          fi
 
           cleanup_pids=()
           for cleanup_dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/share/swift; do
@@ -344,7 +355,8 @@ jobs:
 
       # ==================== 初始化并同步内核源码 ====================
       # 使用 repo 工具从 AOSP 获取 GKI 内核源码
-      - name: 初始化并同步内核源码
+      - name: 解析并锁定源码版本
+        id: source-id
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
           retry() {
@@ -365,11 +377,6 @@ jobs:
               attempt=$((attempt + 1))
             done
           }
-
-          # 克隆 GCC 工具链 (用于 5.x 内核)
-          if [ "${{ inputs.kernel_version }}" = "5.10" ] || [ "${{ inputs.kernel_version }}" = "5.15" ]; then
-            git clone --depth 1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git gcc
-          fi
 
           FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}"
           echo "初始化 repo，分支: common-${FORMATTED_BRANCH}"
@@ -411,17 +418,73 @@ jobs:
             fi
           fi
 
-          retry 3 30 "$REPO" --trace sync -c "-j$(nproc --all)" --no-tags --fail-fast
-          if [ -n "${RELEASE_TAG:-}" ]; then
-            ACTUAL_SUBLEVEL=$(awk '/^SUBLEVEL = / {print $3; exit}' common/Makefile)
-            if [ "$ACTUAL_SUBLEVEL" != "${{ inputs.sub_level }}" ]; then
-              echo "::error::${RELEASE_TAG} 的子版本号为 $ACTUAL_SUBLEVEL，预期为 ${{ inputs.sub_level }}" >&2
+          "$REPO" manifest -o "$RUNNER_TEMP/source-manifest.xml"
+          gcc_sha=""
+          if [ "${{ inputs.kernel_version }}" = "5.10" ] || [ "${{ inputs.kernel_version }}" = "5.15" ]; then
+            gcc_sha=$(retry 4 15 git ls-remote https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git HEAD | awk '{print $1}')
+            if [[ ! "$gcc_sha" =~ ^[a-fA-F0-9]{40}$ ]]; then
+              echo "::error::无法锁定额外 GCC 工具链提交"
               exit 1
             fi
           fi
-          echo "REMOTE_BRANCH=$REMOTE_BRANCH" >> $GITHUB_ENV
+          digest=$(python3 "$GITHUB_WORKSPACE/scripts/source_snapshot.py" "$RUNNER_TEMP/source-manifest.xml" "$RUNNER_TEMP/source-locked.xml" --extra-revision "$gcc_sha")
+          echo "gcc_sha=$gcc_sha" >> "$GITHUB_OUTPUT"
+          cp "$RUNNER_TEMP/source-locked.xml" "$DEFAULT_MANIFEST_PATH"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG:-}" >> "$GITHUB_OUTPUT"
+          echo "REMOTE_BRANCH=$REMOTE_BRANCH" >> "$GITHUB_ENV"
 
-      # 按实际构建入口选择缓存；运行编号允许同一提交持续保存新增缓存。
+      # actions/cache 自动将整个目录压缩为快照，包含 Git 元数据与原配工具链。
+      - name: 恢复未打补丁的源码快照
+        id: source-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.KERNEL_ROOT }}
+          key: source-v1-${{ runner.os }}-${{ steps.source-id.outputs.digest }}-${{ inputs.cache_epoch }}
+
+      - name: 首次同步已锁定的源码和工具链
+        if: steps.source-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          set -euo pipefail
+          # 克隆 GCC 工具链 (用于 5.x 内核)
+          if [ "${{ inputs.kernel_version }}" = "5.10" ] || [ "${{ inputs.kernel_version }}" = "5.15" ]; then
+            git init gcc
+            git -C gcc remote add origin https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git
+            git -C gcc fetch --depth 1 origin "${{ steps.source-id.outputs.gcc_sha }}"
+            git -C gcc checkout --detach FETCH_HEAD
+          fi
+
+          for sync_attempt in 1 2 3; do
+            if "$REPO" sync -c "-j$(nproc)" --no-tags --fail-fast; then
+              break
+            fi
+            if [ "$sync_attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep $((sync_attempt * 30))
+          done
+
+      - name: 验证源码子版本
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          if [ -n "${{ steps.source-id.outputs.release_tag }}" ]; then
+            ACTUAL_SUBLEVEL=$(awk '/^SUBLEVEL = / {print $3; exit}' common/Makefile)
+            if [ "$ACTUAL_SUBLEVEL" != "${{ inputs.sub_level }}" ]; then
+              echo "::error::${{ steps.source-id.outputs.release_tag }} 的子版本号为 $ACTUAL_SUBLEVEL，预期为 ${{ inputs.sub_level }}" >&2
+              exit 1
+            fi
+          fi
+
+      # 必须在功能补丁和 defconfig 修改之前保存。
+      - name: 保存未打补丁的源码快照
+        if: steps.source-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.KERNEL_ROOT }}
+          key: ${{ steps.source-cache.outputs.cache-primary-key }}
+
+      # ccache 固定版本键；Bazel 继续滚动保存新增 action 结果。
       - name: 选择编译缓存
         id: build-cache
         run: |
@@ -438,10 +501,11 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ steps.build-cache.outputs.path }}
-          key: build-v2-${{ runner.os }}-${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ steps.build-cache.outputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: build-v3-${{ runner.os }}-${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ steps.build-cache.outputs.backend }}-${{ inputs.cache_epoch }}-${{ steps.build-cache.outputs.backend == 'ccache' && steps.source-id.outputs.digest || format('{0}-{1}', github.run_id, github.run_attempt) }}
           restore-keys: |
-            build-v2-${{ runner.os }}-${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ steps.build-cache.outputs.backend }}-
-            ${{ steps.build-cache.outputs.backend == 'ccache' && format('{0}-{1}-{2}-ccache-', inputs.android_version, inputs.kernel_version, inputs.sub_level) || 'legacy-bazel-cache-unavailable-' }}
+            build-v3-${{ runner.os }}-${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ steps.build-cache.outputs.backend }}-${{ inputs.cache_epoch }}-
+            ${{ inputs.cache_epoch == 'v1' && format('build-v2-{0}-{1}-{2}-{3}-{4}-{5}-', runner.os, inputs.android_version, inputs.kernel_version, inputs.sub_level, inputs.os_patch_level, steps.build-cache.outputs.backend) || 'no-legacy-cache-' }}
+            ${{ inputs.cache_epoch == 'v1' && steps.build-cache.outputs.backend == 'ccache' && format('{0}-{1}-{2}-ccache-', inputs.android_version, inputs.kernel_version, inputs.sub_level) || 'legacy-bazel-cache-unavailable-' }}
 
       - name: 配置 ccache 并重置本次统计
         if: steps.build-cache.outputs.backend == 'ccache'
@@ -454,6 +518,20 @@ jobs:
           ccache --max-size=2G
           ccache --set-config=compression=true
           ccache --zero-stats
+
+      - name: 恢复 ThinLTO 链接缓存
+        id: thinlto-cache
+        if: steps.build-cache.outputs.backend == 'ccache'
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.cache/gki-thinlto
+          key: thinlto-v1-${{ runner.os }}-${{ steps.source-id.outputs.digest }}-${{ inputs.cache_epoch }}
+
+      - name: 配置持久化 ThinLTO 缓存
+        if: steps.build-cache.outputs.backend == 'ccache'
+        run: |
+          mkdir -p "$HOME/.cache/gki-thinlto"
+          python3 "$GITHUB_WORKSPACE/scripts/configure_thinlto.py" "$KERNEL_ROOT/common/Makefile" "$HOME/.cache/gki-thinlto"
 
       # ==================== 伪装 /proc/config.gz（自动检测） ====================
       # 若仓库存在 config/stock_defconfig，则自动应用；不存在则跳过
@@ -1680,11 +1758,18 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 保存编译缓存
-        if: success()
+        if: success() && steps.restore-build-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
           path: ${{ steps.build-cache.outputs.path }}
           key: ${{ steps.restore-build-cache.outputs.cache-primary-key }}
+
+      - name: 保存 ThinLTO 链接缓存
+        if: success() && steps.build-cache.outputs.backend == 'ccache' && steps.thinlto-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.cache/gki-thinlto
+          key: ${{ steps.thinlto-cache.outputs.cache-primary-key }}
 
       # ==================== 创建 AnyKernel3 压缩包 ====================
       - name: 创建 AnyKernel3 压缩包

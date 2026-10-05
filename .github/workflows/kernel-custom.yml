@@ -11,6 +11,11 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
+      cache_epoch:
+        description: "缓存版本；需要刷新源码/编译缓存时改为新值，如 v2"
+        required: false
+        type: string
+        default: "v1"
       # ==================== 内核版本配置 ====================
       android_version:
         description: "Android 版本"
@@ -152,6 +157,7 @@ jobs:
     uses: ./.github/workflows/build.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       android_version: ${{ inputs.android_version }}
       kernel_version: ${{ inputs.kernel_version }}

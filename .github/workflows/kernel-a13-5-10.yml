@@ -10,6 +10,11 @@ permissions:
 on:
   workflow_call:
     inputs:
+      cache_epoch:
+        description: "缓存版本；需要刷新源码/编译缓存时改为新值，如 v2"
+        required: false
+        type: string
+        default: "v1"
       clean_build:
         type: boolean
         default: false
@@ -64,6 +69,7 @@ jobs:
     uses: ./.github/workflows/build.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       android_version: ${{ matrix.android_version }}
       kernel_version: ${{ matrix.kernel_version }}

@@ -25,6 +25,11 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
+      cache_epoch:
+        description: "缓存版本；需要刷新源码/编译缓存时改为新值，如 v2"
+        required: false
+        type: string
+        default: "v1"
       # ==================== 发布配置 ====================
       release_type:
         description: "发布类型"
@@ -228,6 +233,7 @@ jobs:
     uses: ./.github/workflows/build.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       android_version: ${{ matrix.android_version }}
       kernel_version: ${{ matrix.kernel_version }}
@@ -255,6 +261,7 @@ jobs:
     uses: ./.github/workflows/kernel-a12-5-10.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       kernelsu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
       version: ${{ inputs.version }}
@@ -275,6 +282,7 @@ jobs:
     uses: ./.github/workflows/kernel-a13-5-10.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       kernelsu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
       version: ${{ inputs.version }}
@@ -295,6 +303,7 @@ jobs:
     uses: ./.github/workflows/kernel-a13-5-15.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       kernelsu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
       version: ${{ inputs.version }}
@@ -315,6 +324,7 @@ jobs:
     uses: ./.github/workflows/kernel-a13-5-15.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       android_version: android14
       clean_build: ${{ inputs.clean_build }}
       kernelsu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
@@ -336,6 +346,7 @@ jobs:
     uses: ./.github/workflows/kernel-a14-6-1.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       kernelsu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
       version: ${{ inputs.version }}
@@ -356,6 +367,7 @@ jobs:
     uses: ./.github/workflows/kernel-a15-6-6.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       kernelsu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
       version: ${{ inputs.version }}
@@ -376,6 +388,7 @@ jobs:
     uses: ./.github/workflows/kernel-a16-6-12.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       kernelsu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
       version: ${{ inputs.version }}
@@ -408,6 +421,7 @@ jobs:
     uses: ./.github/workflows/build.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       android_version: ${{ matrix.android_version }}
       kernel_version: ${{ matrix.kernel_version }}
