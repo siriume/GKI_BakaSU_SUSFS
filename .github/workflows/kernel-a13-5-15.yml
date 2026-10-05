@@ -11,7 +11,7 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
-      # KernelSU 变体固定为 ReSukiSU
+      # KernelSU 变体固定为 BakaSU
       kernelsu_branch:
         description: "KSU 分支 (main/builtin/自定义commit hash，留空使用默认)"
         required: false
@@ -26,16 +26,17 @@ on:
         description: "自定义版本名 (可选)"
         required: false
         type: string
+        default: "5.15.178-android13-8-00021-g6f2f96be86b9-ab13729987"
       build_time:
         description: "自定义构建时间 (可选，N或留空=当前UTC)"
         required: false
         type: string
-        default: "Sun Dec 01 08:10:00 UTC 2024"
+        default: "Wed Jul 2 02:41:59 UTC 2025"
       use_zram:
         description: "启用 ZRAM 增强算法"
         required: true
         type: boolean
-        default: false
+        default: true
       use_bbg:
         description: "启用 BBG 防格机"
         required: true
@@ -70,7 +71,7 @@ on:
           - "678"
           - "123"
           - "345"
-        default: "off"
+        default: "678"
       droidspaces_ntsync:
         description: "启用 Droidspaces 容器 NTSync 支持（需启用 Droidspaces）"
         required: false
@@ -91,7 +92,7 @@ on:
         required: false
         type: boolean
         default: false
-      # KernelSU 变体固定为 ReSukiSU
+      # KernelSU 变体固定为 BakaSU
       kernelsu_branch:
         required: true
         type: string
@@ -158,7 +159,7 @@ jobs:
       sub_level: ${{ matrix.sub_level }}
       os_patch_level: ${{ matrix.os_patch_level }}
       revision: ${{ matrix.revision || '' }}
-      ksu_variant: ${{ inputs.clean_build && 'Clean' || 'ReSukiSU' }}
+      ksu_variant: ${{ inputs.clean_build && 'Clean' || 'BakaSU' }}
       ksu_branch: ${{ inputs.kernelsu_branch }}
       version: ${{ inputs.version || '' }}
       build_time: ${{ inputs.build_time || '' }}

@@ -1,7 +1,7 @@
 # ========================================
 # GKI 内核构建工作流
 # ========================================
-# 此工作流负责编译 Android GKI 内核，支持 ReSukiSU、SUSFS 和清洁 GKI 构建
+# 此工作流负责编译 Android GKI 内核，支持 BakaSU、SUSFS 和清洁 GKI 构建
 # 通过 workflow_call 被其他工作流调用，不直接手动触发
 # ========================================
 
@@ -308,8 +308,8 @@ jobs:
             sed -i '/^ui_print "Our Telegram Channel:"/,$d' AnyKernel3/anykernel.sh
             rm -f AnyKernel3/banner
 
-            if grep -Rqs 'ReSukiSU' AnyKernel3; then
-              echo "::error::清洁构建的 AnyKernel3 中仍包含 ReSukiSU 标识"
+            if grep -Rqs 'BakaSU' AnyKernel3; then
+              echo "::error::清洁构建的 AnyKernel3 中仍包含 BakaSU 标识"
               exit 1
             fi
 
@@ -321,7 +321,7 @@ jobs:
             echo "Android 17 / 6.18 暂无 SUSFS 上游分支，跳过克隆。"
           else
             echo "克隆 SUSFS (分支: $SUSFS_BRANCH)..."
-            # ReSukiSU 使用 simonpunk 的原版 SUSFS
+            # BakaSU 使用 simonpunk 的原版 SUSFS
             git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH"
 
             # 检查是否启用自定义提交
@@ -472,6 +472,33 @@ jobs:
             exit 1
           fi
 
+      # ==================== 伪装 /proc/config.gz（自动过滤版, 仅 5.10） ====================
+      # 仅针对 android12-5.10:不改汇报内容来源,
+      # 仅在生成 config_data 时 sed 过滤掉 FCM 撞线的配置项(如 SYSVIPC),
+      # 汇报值始终是真实构建配置,无需维护整份 stock_defconfig
+      - name: 应用 Stock Config 伪装(自动过滤)
+        if: inputs.clean_build != true && inputs.kernel_version == '5.10'
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/config/stock_defconfig" ]; then
+            echo "已存在 config/stock_defconfig,由整文件伪装接管,跳过自动过滤。"
+            exit 0
+          fi
+          python3 - <<'PYEOF'
+          p = 'kernel/Makefile'
+          s = open(p).read()
+          old = 'filechk_cat = cat $<'
+          new = ("filechk_cat = sed -e 's/^CONFIG_SYSVIPC=y/\\# CONFIG_SYSVIPC is not set/'"
+                 " -e '/^CONFIG_SYSVIPC_SYSCTL=y/d' -e '/^CONFIG_SYSVIPC_COMPAT=y/d' $<")
+          if new in s:
+              print('filechk_cat 已是过滤版,跳过。')
+          elif old in s:
+              open(p, 'w').write(s.replace(old, new, 1))
+              print('已将 filechk_cat 替换为过滤版。')
+          else:
+              raise SystemExit('::error::未在 kernel/Makefile 找到规则: ' + old)
+          PYEOF
+
       # ==================== 提取实际子版本号 ====================
       # 从 Makefile 中读取真实的 SUBLEVEL 值
       - name: 提取实际子版本号
@@ -557,7 +584,7 @@ jobs:
           echo "obj-y += hmbird_patch.o" >> Makefile
 
       # ==================== 确定 KernelSU 分支 ====================
-      # ReSukiSU 支持自定义分支或 commit hash
+      # BakaSU 支持自定义分支或 commit hash
       - name: 确定 KernelSU 分支
         id: ksu-branch
         if: inputs.clean_build != true
@@ -569,7 +596,7 @@ jobs:
             BRANCH="$branch_input"
             echo "使用自定义分支/提交: $branch_input"
           else
-            # ReSukiSU 默认使用 main 分支
+            # BakaSU 默认使用 main 分支
             BRANCH="main"
           fi
 
@@ -577,19 +604,19 @@ jobs:
           echo "KSU 分支: $BRANCH"
 
       # ==================== 添加 KernelSU ====================
-      # 添加 ReSukiSU
+      # 添加 BakaSU
       - name: 添加 KernelSU
         if: inputs.clean_build != true
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
           set -euo pipefail
-          echo "添加 ReSukiSU..."
-          curl -fLSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s -- "$BRANCH"
+          echo "添加 BakaSU..."
+          curl -fLSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s -- "$BRANCH"
 
           if [ -d "KernelSU/.git" ]; then
             KSU_ACTUAL_REF=$(git -C KernelSU rev-parse HEAD)
             if [[ "$BRANCH" =~ ^[a-fA-F0-9]{40}$ ]] && [[ "${KSU_ACTUAL_REF,,}" != "${BRANCH,,}" ]]; then
-              echo "::error::ReSukiSU 实际提交 $KSU_ACTUAL_REF 与指定提交 $BRANCH 不一致"
+              echo "::error::BakaSU 实际提交 $KSU_ACTUAL_REF 与指定提交 $BRANCH 不一致"
               exit 1
             fi
             echo "KSU_ACTUAL_REF=$KSU_ACTUAL_REF" >> "$GITHUB_ENV"
@@ -597,7 +624,7 @@ jobs:
             echo "KSU_LATEST_COMMIT_DATE=$KSU_LATEST_COMMIT_DATE" >> "$GITHUB_ENV"
             echo "KSU 仓库最新提交日期: $KSU_LATEST_COMMIT_DATE"
           else
-            echo "::error::ReSukiSU 安装后缺少 KernelSU 仓库"
+            echo "::error::BakaSU 安装后缺少 KernelSU 仓库"
             exit 1
           fi
 
@@ -626,8 +653,8 @@ jobs:
 
               cd ..
               ;;
-            "Next"|"SukiSU"|"ReSukiSU")
-              echo "Next/SukiSU/ReSukiSU 使用内置 SUSFS 支持"
+            "Next"|"SukiSU"|"BakaSU")
+              echo "Next/SukiSU/BakaSU 使用内置 SUSFS 支持"
               ;;
           esac
 
@@ -782,7 +809,7 @@ jobs:
             fi
           fi
 
-          if [ "${{ inputs.ksu_variant }}" == "Official" ] || [ "${{ inputs.ksu_variant }}" == "Next" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU" ] || [ "${{ inputs.ksu_variant }}" == "ReSukiSU" ]; then
+          if [ "${{ inputs.ksu_variant }}" == "Official" ] || [ "${{ inputs.ksu_variant }}" == "Next" ] || [ "${{ inputs.ksu_variant }}" == "SukiSU" ] || [ "${{ inputs.ksu_variant }}" == "BakaSU" ]; then
             # Android 12 - 5.10 修复
             if [[ "${{ inputs.android_version }}" == "android12" && "${{ inputs.kernel_version }}" == "5.10" ]]; then
                if [[ "$CURRENT_SUB" -le 209 ]]; then
@@ -1319,12 +1346,12 @@ jobs:
           if [[ ! "$CURRENT_SUB" =~ ^[0-9]+$ ]]; then
             CURRENT_SUB=99999
           fi
-          if [[ "${{ inputs.ksu_variant }}" == "ReSukiSU" && "${{ inputs.kernel_version }}" == "5.15" && "$CURRENT_SUB" -ge 74 && "$CURRENT_SUB" -le 137 ]]; then
+          if [[ "${{ inputs.ksu_variant }}" == "BakaSU" && "${{ inputs.kernel_version }}" == "5.15" && "$CURRENT_SUB" -ge 74 && "$CURRENT_SUB" -le 137 ]]; then
             {
               echo "CONFIG_KALLSYMS=y"
               echo "CONFIG_KALLSYMS_ALL=y"
             } >> "$DEFCONFIG"
-            # 修复 5.15.74~5.15.137: kallsyms_on_each_symbol 仅在 LIVEPATCH 下编译，导致 ReSukiSU 链接失败
+            # 修复 5.15.74~5.15.137: kallsyms_on_each_symbol 仅在 LIVEPATCH 下编译，导致 BakaSU 链接失败
             KALLSYMS_C="./common/kernel/kallsyms.c"
             if [ -f "$KALLSYMS_C" ] \
               && grep -qF 'int kallsyms_on_each_symbol' "$KALLSYMS_C" \
@@ -1630,63 +1657,66 @@ jobs:
 
       # ==================== 构建 Boot 镜像 (Android 12) ====================
       # Android 12 需要从 GKI 认证镜像中提取 ramdisk
-#      - name: 构建 Boot 镜像 (Android 12)
-#        if: inputs.android_version == 'android12'
-#        working-directory: bootimgs
-#        run: |
-#          GKI_URL=https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-${{ inputs.os_patch_level }}_${{ inputs.revision }}.zip
-#          FALLBACK_URL=https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-2023-01_r1.zip
-#
-#          status=$(curl -sL -w "%{http_code}" "$GKI_URL" -o /dev/null)
-#          if [ "$status" = "200" ]; then
-#            curl -Lo gki-kernel.zip "$GKI_URL"
-#          else
-#            curl -Lo gki-kernel.zip "$FALLBACK_URL"
-#          fi
-#
-#          unzip gki-kernel.zip && rm gki-kernel.zip
-#          $UNPACK_BOOTIMG --boot_img="$(pwd)/boot-5.10.img"
-#
-#          gzip -n -k -f -9 ./Image > ./Image.gz
-#
-#         # 创建普通 boot.img
-#          $MKBOOTIMG --header_version 4 --kernel Image --output boot.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
-#          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-#          cp ./boot.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot.img
-#
-#          # 创建 gzip 压缩的 boot.img
-#          $MKBOOTIMG --header_version 4 --kernel Image.gz --output boot-gz.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
-#          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-gz.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-#          cp ./boot-gz.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot-gz.img
-#
-#          # 创建 lz4 压缩的 boot.img
-#          $MKBOOTIMG --header_version 4 --kernel Image.lz4 --output boot-lz4.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
-#          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-#          cp ./boot-lz4.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot-lz4.img
-#
-#      # ==================== 构建 Boot 镜像 (Android 13+) ====================
-#      # Android 13 及以上版本不需要 ramdisk
-#      - name: 构建 Boot 镜像 (Android 13+)
-#        if: inputs.android_version == 'android13' || inputs.android_version == 'android14' || inputs.android_version == 'android15' || inputs.android_version == 'android16'
-#        working-directory: bootimgs
-#        run: |
-#          gzip -n -k -f -9 ./Image > ./Image.gz
-#
-#          # 创建普通 boot.img
-#          $MKBOOTIMG --header_version 4 --kernel Image --output boot.img
-#          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-#          cp ./boot.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot.img
-#
-#          # 创建 gzip 压缩的 boot.img
-#          $MKBOOTIMG --header_version 4 --kernel Image.gz --output boot-gz.img
-#          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-gz.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-#          cp ./boot-gz.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot-gz.img
-#
-#          # 创建 lz4 压缩的 boot.img
-#          $MKBOOTIMG --header_version 4 --kernel Image.lz4 --output boot-lz4.img
-#          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-#          cp ./boot-lz4.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot-lz4.img
-#
+      - name: 构建 Boot 镜像 (Android 12)
+        if: inputs.android_version == 'android12'
+        working-directory: ${{ env.KERNEL_ROOT }}/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist
+        run: |
+          GKI_URL=https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-${{ inputs.os_patch_level }}_${{ inputs.revision }}.zip
+          FALLBACK_URL=https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-2023-01_r1.zip
+
+          status=$(curl -sL -w "%{http_code}" "$GKI_URL" -o /dev/null)
+          if [ "$status" = "200" ]; then
+            curl -Lo gki-kernel.zip "$GKI_URL"
+          else
+            curl -Lo gki-kernel.zip "$FALLBACK_URL"
+          fi
+
+          unzip gki-kernel.zip && rm gki-kernel.zip
+          $UNPACK_BOOTIMG --boot_img="$(pwd)/boot-5.10.img"
+
+          gzip -n -k -f -9 ./Image > ./Image.gz
+          PREFIX="${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}"
+          
+          # 创建普通 boot.img
+          $MKBOOTIMG --header_version 4 --kernel Image --output boot.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
+          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+          cp ./boot.img $GITHUB_WORKSPACE/${PREFIX}-boot.img
+
+          # 创建 gzip 压缩的 boot.img
+          $MKBOOTIMG --header_version 4 --kernel Image.gz --output boot-gz.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
+          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-gz.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+          cp ./boot-gz.img $GITHUB_WORKSPACE/${PREFIX}-boot-gz.img
+
+          # 创建 lz4 压缩的 boot.img
+          $MKBOOTIMG --header_version 4 --kernel Image.lz4 --output boot-lz4.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
+          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+          cp ./boot-lz4.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot-lz4.img
+          cp ./boot-lz4.img $GITHUB_WORKSPACE/${PREFIX}-boot-lz4.img
+
+      # ==================== 构建 Boot 镜像 (Android 13+) ====================
+      # Android 13 及以上版本不需要 ramdisk
+      - name: 构建 Boot 镜像 (Android 13+)
+        if: inputs.android_version == 'android13' || inputs.android_version == 'android14' || inputs.android_version == 'android15' || inputs.android_version == 'android16'
+        working-directory: ${{ inputs.android_version == 'android13' && format('{0}/out/{1}-{2}/dist', env.KERNEL_ROOT, inputs.android_version, inputs.kernel_version) || 'bootimgs' }}
+        run: |
+          gzip -n -k -f -9 ./Image > ./Image.gz
+          PREFIX="${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}"
+
+          # 创建普通 boot.img
+          $MKBOOTIMG --header_version 4 --kernel Image --output boot.img
+          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+          cp ./boot.img $GITHUB_WORKSPACE/${PREFIX}-boot.img
+
+          # 创建 gzip 压缩的 boot.img
+          $MKBOOTIMG --header_version 4 --kernel Image.gz --output boot-gz.img
+          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-gz.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+          cp ./boot-gz.img $GITHUB_WORKSPACE/${PREFIX}-boot-gz.img
+
+          # 创建 lz4 压缩的 boot.img
+          $MKBOOTIMG --header_version 4 --kernel Image.lz4 --output boot-lz4.img
+          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+          cp ./boot-lz4.img $GITHUB_WORKSPACE/${PREFIX}-boot-lz4.img
+
       # ==================== 收集补丁冲突文件 ====================
       # 收集所有 .rej 文件用于调试补丁失败问题
       - name: 收集补丁冲突文件
@@ -1724,7 +1754,7 @@ jobs:
           name: ${{ env.BUILD_VARIANT }}_kernel-${{ env.CONFIG }}
           path: |
             *AnyKernel3.zip
-#            *.img
+            *.img
           compression-level: 0
 
       # ==================== 上传补丁冲突文件 ====================
