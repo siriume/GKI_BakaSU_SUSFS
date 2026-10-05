@@ -457,7 +457,8 @@ jobs:
           fi
 
           for sync_attempt in 1 2 3; do
-            if "$REPO" sync -c "-j$(nproc)" --no-tags --fail-fast; then
+            echo "源码同步：第 ${sync_attempt}/3 次尝试 ($(date -u +%FT%TZ))"
+            if "$REPO" sync -c "-j$(nproc)" --no-tags --fail-fast --verbose; then
               break
             fi
             if [ "$sync_attempt" -eq 3 ]; then
