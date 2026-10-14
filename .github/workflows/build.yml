@@ -301,7 +301,7 @@ jobs:
           SUSFS_BRANCH="gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}"
 
           echo "克隆 AnyKernel3..."
-          git clone "$ANYKERNEL_REPO" -b "$ANYKERNEL_BRANCH"
+          git clone --depth=1 "$ANYKERNEL_REPO" -b "$ANYKERNEL_BRANCH"
           rm -rf AnyKernel3/.git
 
           if [ "${{ inputs.clean_build }}" = "true" ]; then
@@ -324,7 +324,7 @@ jobs:
           else
             echo "克隆 SUSFS (分支: $SUSFS_BRANCH)..."
             # BakaSU 使用 simonpunk 的原版 SUSFS
-            git clone https://github.com/siriume/susfs4oki -b "$SUSFS_BRANCH" susfs4ksu
+            git clone --depth=1 https://github.com/siriume/susfs4oki -b "$SUSFS_BRANCH" susfs4ksu
 
             # 检查是否启用自定义提交
             CONFIG_FILE="config/config"
@@ -334,9 +334,12 @@ jobs:
                 CUSTOM_COMMIT=$(grep "^${SUSFS_BRANCH}=" "$CONFIG_FILE" | cut -d'=' -f2)
                 if [ -n "$CUSTOM_COMMIT" ]; then
                   echo "切换 SUSFS 到自定义提交: $CUSTOM_COMMIT"
-                  cd susfs4ksu
-                  git checkout "$CUSTOM_COMMIT"
-                  cd ..
+                  if git -C susfs4ksu cat-file -e "${CUSTOM_COMMIT}^{commit}" 2>/dev/null; then
+                    git -C susfs4ksu checkout --detach "$CUSTOM_COMMIT"
+                  else
+                    git -C susfs4ksu fetch --depth=1 origin "$CUSTOM_COMMIT"
+                    git -C susfs4ksu checkout --detach FETCH_HEAD
+                  fi
                 fi
               fi
             fi
@@ -347,8 +350,8 @@ jobs:
           fi
 
           echo "准备补丁资源..."
-          git clone https://github.com/WildKernels/kernel_patches.git
-          git clone https://github.com/ShirkNeko/SukiSU_patch.git
+          git clone --depth=1 https://github.com/WildKernels/kernel_patches.git
+          git clone --depth=1 https://github.com/ShirkNeko/SukiSU_patch.git
           echo "使用当前仓库补丁目录: $ZZH_PATCHES"
           git clone https://github.com/Numbersf/Action-Build.git --depth=1
 
