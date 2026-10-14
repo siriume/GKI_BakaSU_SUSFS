@@ -1,6 +1,7 @@
 {
   "android_version": "android12",
   "kernel_version": "5.10",
+  "pinned_dates": ["2023-11"],
   "entries": [
     {
       "date": "2021-08",

@@ -40,10 +40,31 @@ def update_target(android_ver: str, kernel_ver: str,
             "kernel_version": kernel_ver,
             "entries": [],
         }
+        if has_release_tags:
+            data["pinned_dates"] = []
         if not is_k510:
             data["lts"] = None
         entries = []
     original_data = copy.deepcopy(data)
+
+    if has_release_tags:
+        if "pinned_dates" in data:
+            pinned_dates = set(data["pinned_dates"])
+            # A pin list is authoritative. This also removes months accidentally
+            # added by older updater versions.
+            entries = [
+                entry for entry in entries
+                if entry.get("date") == "lts" or entry.get("date") in pinned_dates
+            ]
+            data["entries"] = entries
+        else:
+            # Existing monthly entries are the user's fixed selection. An empty
+            # selection opts into full discovery and is persisted for later runs.
+            pinned_dates = {entry["date"] for entry in entries if entry.get("date") != "lts"}
+            if not pinned_dates:
+                data["pinned_dates"] = []
+    else:
+        pinned_dates = set()
 
     existing_by_date = {e["date"]: e for e in entries}
     all_dates = make_date_range(date_start, end)
@@ -51,9 +72,12 @@ def update_target(android_ver: str, kernel_ver: str,
         release_tags = fetch_latest_release_tags(android_ver, kernel_ver)
         monthly_branches = fetch_monthly_branches(android_ver, kernel_ver)
         for date in all_dates:
+            current = existing_by_date.get(date)
+            # For curated GKI release-tag kernels, refresh only selected months.
+            if pinned_dates and date not in pinned_dates:
+                continue
             release = release_tags.get(date)
             tag = release[0] if release is not None else None
-            current = existing_by_date.get(date)
             previous = current.copy() if current is not None else None
             if tag is None:
                 if date not in monthly_branches:
@@ -62,10 +86,8 @@ def update_target(android_ver: str, kernel_ver: str,
                     continue
                 text = fetch_makefile(android_ver, kernel_ver, date, dep_cutoff)
                 if text is None:
-                    # The current month's branch may appear before its Makefile is
-                    # published. Treat that as an incomplete month only when there
-                    # is no existing entry to update; missing historical data stays
-                    # fatal so the updater cannot silently drop a known release.
+                    # An unpublished current-month branch is expected only when
+                    # discovering all releases; a missing pinned month is an error.
                     if date == end and current is None:
                         print(f"  [{date}] monthly branch has no Makefile yet, skip")
                         continue
