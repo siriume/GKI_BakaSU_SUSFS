@@ -25,6 +25,11 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
+      cache_epoch:
+        description: "缓存版本；需要刷新源码/编译缓存时改为新值，如 v2"
+        required: false
+        type: string
+        default: "v1"
       # ==================== 发布配置 ====================
       release_type:
         description: "发布类型"
@@ -232,6 +237,7 @@ jobs:
     uses: ./.github/workflows/build.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       android_version: ${{ matrix.android_version }}
       kernel_version: ${{ matrix.kernel_version }}
@@ -260,6 +266,7 @@ jobs:
     uses: ./.github/workflows/kernel-a12-5-10.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       kernelsu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
       version: ${{ inputs.version }}
@@ -281,6 +288,7 @@ jobs:
     uses: ./.github/workflows/kernel-a13-5-10.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       kernelsu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
       version: ${{ inputs.version }}
@@ -302,6 +310,7 @@ jobs:
     uses: ./.github/workflows/kernel-a13-5-15.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       kernelsu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
       version: ${{ inputs.version }}
@@ -323,6 +332,7 @@ jobs:
     uses: ./.github/workflows/kernel-a13-5-15.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       android_version: android14
       clean_build: ${{ inputs.clean_build }}
       kernelsu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
@@ -345,6 +355,7 @@ jobs:
     uses: ./.github/workflows/kernel-a14-6-1.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       kernelsu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
       version: ${{ inputs.version }}
@@ -366,6 +377,7 @@ jobs:
     uses: ./.github/workflows/kernel-a15-6-6.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       kernelsu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
       version: ${{ inputs.version }}
@@ -387,6 +399,7 @@ jobs:
     uses: ./.github/workflows/kernel-a16-6-12.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
       kernelsu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
       version: ${{ inputs.version }}
@@ -408,7 +421,16 @@ jobs:
     uses: ./.github/workflows/kernel-a17-6-18.yml
     secrets: inherit
     with:
+      cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
       clean_build: ${{ inputs.clean_build }}
+      android_version: ${{ matrix.android_version }}
+      kernel_version: ${{ matrix.kernel_version }}
+      sub_level: ${{ matrix.sub_level }}
+      os_patch_level: ${{ matrix.os_patch_level }}
+      revision: ${{ matrix.revision || '' }}
+      ksu_variant: ${{ inputs.clean_build && 'Clean' || 'BakaSU' }}
+      ksu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
+      version: ${{ inputs.version || '' }}
       kernelsu_branch: ${{ needs.resolve-ksu-ref.outputs.sha || 'main' }}
       version: ${{ inputs.version }}
       build_time: ${{ inputs.build_time || '' }}
@@ -469,7 +491,7 @@ jobs:
   # 当 release_type 不是 Actions 时，创建 GitHub Release
   # 仅限原仓库运行，fork 仓库跳过此步骤
   release:
-    if: ${{ always() && !cancelled() && needs.resolve-ksu-ref.result == 'success' && !inputs.build_kernel_version && inputs.release_type != 'Actions' && github.repository == 'zhuzhuzihan/GKI_BakaSU_SUSFS' }}
+    if: ${{ always() && !cancelled() && needs.resolve-ksu-ref.result == 'success' && !inputs.build_kernel_version && inputs.release_type != 'Actions' && github.repository == 'siriume/GKI_ReSukiSU_SUSFS' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -857,7 +879,7 @@ jobs:
           <pre>${INPUT_CHANGE_LOG}
           </pre>
           
-          Download: <a href="https://github.com/zhuzhuzihan/GKI_BakaSU_SUSFS/releases/tag/${NEW_TAG}">Click Here</a>
+          Download: <a href="https://github.com/siriume/GKI_ReSukiSU_SUSFS/releases/tag/${NEW_TAG}">Click Here</a>
 
           Workflow commit: <code>${WORKFLOW_COMMIT}</code>
           EOF
@@ -901,7 +923,7 @@ jobs:
           <pre>${INPUT_CHANGE_LOG}
           </pre>
           
-          Download: <a href="https://github.com/zhuzhuzihan/GKI_BakaSU_SUSFS/releases/tag/${NEW_TAG}">Click Here</a>
+          Download: <a href="https://github.com/siriume/GKI_ReSukiSU_SUSFS/releases/tag/${NEW_TAG}">Click Here</a>
 
           Workflow commit: <code>${WORKFLOW_COMMIT}</code>
           EOF

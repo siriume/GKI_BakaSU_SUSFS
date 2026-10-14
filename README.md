@@ -4,19 +4,17 @@
 
 基于 GitHub Actions 构建 Android GKI 内核，集成 BakaSU 与 SUSFS。
 
-简体中文 / [English](README_EN.md)
-
-[![Release](https://img.shields.io/github/v/release/coolzyd9107/GKI_BakaSU_SUSFS?label=Release&style=flat-square&logo=github&logoColor=white&color=2ea44f)](https://github.com/zhuzhuzihan/GKI_BakaSU_SUSFS/releases)
-[![构建内核](https://github.com/zhuzhuzihan/GKI_BakaSU_SUSFS/actions/workflows/main.yml/badge.svg)](https://github.com/zhuzhuzihan/GKI_BakaSU_SUSFS/actions/workflows/main.yml)
-[![Telegram](https://img.shields.io/static/v1?label=Telegram&message=Channel&color=0088cc)](https://t.me/BakaSUKernelBuilds)
-[![BakaSU](https://img.shields.io/badge/KernelSU-BakaSU-5AA300?style=flat-square)](https://github.com/Baka-SU/BakaSU)
+[![Release](https://img.shields.io/github/v/release/siriume/GKI_ReSukiSU_SUSFS?label=Release&style=flat-square&logo=github&logoColor=white&color=2ea44f)](https://github.com/siriume/GKI_ReSukiSU_SUSFS/releases)
+[![构建内核](https://github.com/siriume/GKI_ReSukiSU_SUSFS/actions/workflows/main.yml/badge.svg)](https://github.com/siriume/GKI_ReSukiSU_SUSFS/actions/workflows/main.yml)
+[![Telegram](https://img.shields.io/static/v1?label=Telegram&message=Channel&color=0088cc)](https://t.me/ReSukiSUKernelBuilds)
+[![BakaSU](https://img.shields.io/badge/KernelSU-ReSukiSU-5AA300?style=flat-square)](https://github.com/Baka-SU/BakaSU)
 [![SUSFS](https://img.shields.io/badge/Filesystem-SUSFS-E67E22?style=flat-square)](https://gitlab.com/simonpunk/susfs4ksu)
 
 </div>
 
 ## 项目说明
 
-本仓库提供 Actions 云端构建流程，按 Android GKI KMI 和安全补丁级别生成 AnyKernel3 安装包。常规构建使用 BakaSU 同时可以自行在工作流配置中启用其它可选功能；也可以选择 Clean build，生成不集成 KernelSU、SUSFS 与可选功能补丁的内核。
+本仓库提供 Actions 云端构建流程，按 Android GKI KMI 和安全补丁级别生成 AnyKernel3 安装包。常规构建使用 BakaSU；也可以选择 Clean build，生成不集成 KernelSU、SUSFS 与可选功能补丁的内核。
 
 内核版本与发布修订从 `data/android*/` 下的 JSON 矩阵读取，并由数据同步工作流定期更新。
 
@@ -41,7 +39,7 @@
 
 ## 运行构建
 
-1. 打开仓库的 [Actions](https://github.com/zhuzhuzihan/GKI_BakaSU_SUSFS/actions) 页面，选择 **构建内核** 工作流并点击 **Run workflow**。
+1. 打开仓库的 [Actions](https://github.com/siriume/GKI_ReSukiSU_SUSFS/actions) 页面，选择 **构建内核** 工作流并点击 **Run workflow**。
 2. 在 `build_target` 中选择一个 KMI，或选择 `all` 构建全部目标。choice 是单选项；需要构建多个但不是全部时，分别运行对应目标。
 3. 根据需要设置功能选项和 `release_type`，然后启动工作流。
 4. 构建完成后，在运行详情页的 **Artifacts** 下载产物；创建 Release 时也可以从 Release 页面下载。

@@ -18,6 +18,11 @@ permissions:
 on:
   workflow_call:
     inputs:
+      cache_epoch:
+        description: "缓存版本；需要刷新源码/编译缓存时改为新值，如 v2"
+        required: false
+        type: string
+        default: "v1"
       # ==================== 基础配置 ====================
       android_version:
         required: true
@@ -106,6 +111,7 @@ jobs:
     # ccache 配置用于加速重复编译
     env:
       BUILD_VARIANT: ${{ inputs.clean_build && 'Clean' || inputs.ksu_variant }}
+      CCACHE_KEY: ccache-v3-gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
       CCACHE_HARDLINK: "true"
@@ -161,22 +167,39 @@ jobs:
           fi
           echo "Droidspaces 使用上游标记为 6.12-or-above 的 kABI 补丁；BBG 保持启用。"
 
-      # ==================== 清理磁盘空间 ====================
-      # GitHub Actions 默认磁盘空间有限，需要清理不必要的预装软件
+      # 定点并行清理无关的大目录，保留 swap、系统 LLVM 和其余工具缓存。
+      # 清理在当前步骤内完成，避免后台删除与后续同步、编译争用磁盘。
       - name: 清理磁盘空间
-        uses: endersonmenezes/free-disk-space@v3
-        with:
-          remove_android: true
-          remove_dotnet: true
-          remove_haskell: true
-          remove_tool_cache: true
-          remove_swap: true
-          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
-          remove_packages_one_command: true
-          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
-          rm_cmd: "rmz"
-          rmz_version: "3.1.1"
-          testing: false
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          echo "=== 清理前 ==="
+          df -h "$GITHUB_WORKSPACE"
+          free -h
+
+          available_kib=$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')
+          if [ "$available_kib" -ge $((50 * 1024 * 1024)) ]; then
+            echo "剩余空间至少 50 GiB，跳过目录清理。"
+            exit 0
+          fi
+
+          cleanup_pids=()
+          for cleanup_dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/share/swift; do
+            if [ -d "$cleanup_dir" ]; then
+              echo "清理 $cleanup_dir"
+              sudo rm -rf -- "$cleanup_dir" &
+              cleanup_pids+=("$!")
+            fi
+          done
+
+          cleanup_status=0
+          for cleanup_pid in "${cleanup_pids[@]}"; do
+            wait "$cleanup_pid" || cleanup_status=1
+          done
+          echo "=== 清理后 ==="
+          df -h "$GITHUB_WORKSPACE"
+          free -h
+          exit "$cleanup_status"
 
       # ==================== 检出仓库代码 ====================
       - name: 检出代码仓库
@@ -237,25 +260,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ccache python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves
-
-      # ==================== 配置 ccache ====================
-      # ccache 用于缓存编译结果，加速后续构建
-      - name: 配置 ccache
-        run: |
-          mkdir -p ~/.cache/bazel
-          ccache --version
-          ccache --max-size=2G
-          ccache --set-config=compression=true
-          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
-
-      # ==================== 恢复 ccache 缓存 ====================
-      - name: 恢复 ccache 缓存
-        uses: actions/cache@v5
-        with:
-          path: ~/.ccache
-          key: ${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-ccache-${{ github.sha }}
-          restore-keys: |
-            ${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-ccache-
 
       # ==================== 缓存工具链 ====================
       # 缓存 AOSP 构建工具，避免每次重新下载
@@ -327,7 +331,7 @@ jobs:
           else
             echo "克隆 SUSFS (分支: $SUSFS_BRANCH)..."
             # BakaSU 使用 simonpunk 的原版 SUSFS
-            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH"
+            git clone https://github.com/siriume/susfs4oki -b "$SUSFS_BRANCH" susfs4ksu
 
             # 检查是否启用自定义提交
             CONFIG_FILE="config/config"
@@ -357,7 +361,8 @@ jobs:
 
       # ==================== 初始化并同步内核源码 ====================
       # 使用 repo 工具从 AOSP 获取 GKI 内核源码
-      - name: 初始化并同步内核源码
+      - name: 解析并锁定源码版本
+        id: source-id
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
           retry() {
@@ -378,9 +383,6 @@ jobs:
               attempt=$((attempt + 1))
             done
           }
-
-          # 克隆 GCC 工具链 (用于 5.x 内核)
-          git clone https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git gcc
 
           FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}"
           echo "初始化 repo，分支: common-${FORMATTED_BRANCH}"
@@ -422,15 +424,124 @@ jobs:
             fi
           fi
 
-          retry 3 30 "$REPO" --trace sync -c "-j$(nproc --all)" --no-tags --fail-fast
-          if [ -n "${RELEASE_TAG:-}" ]; then
-            ACTUAL_SUBLEVEL=$(awk '/^SUBLEVEL = / {print $3; exit}' common/Makefile)
-            if [ "$ACTUAL_SUBLEVEL" != "${{ inputs.sub_level }}" ]; then
-              echo "::error::${RELEASE_TAG} 的子版本号为 $ACTUAL_SUBLEVEL，预期为 ${{ inputs.sub_level }}" >&2
+          "$REPO" manifest -o "$RUNNER_TEMP/source-manifest.xml"
+          gcc_sha=""
+          if [ "${{ inputs.kernel_version }}" = "5.10" ] || [ "${{ inputs.kernel_version }}" = "5.15" ]; then
+            gcc_sha=$(retry 4 15 git ls-remote https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git HEAD | awk '{print $1}')
+            if [[ ! "$gcc_sha" =~ ^[a-fA-F0-9]{40}$ ]]; then
+              echo "::error::无法锁定额外 GCC 工具链提交"
               exit 1
             fi
           fi
-          echo "REMOTE_BRANCH=$REMOTE_BRANCH" >> $GITHUB_ENV
+          digest=$(python3 "$GITHUB_WORKSPACE/scripts/source_snapshot.py" "$RUNNER_TEMP/source-manifest.xml" "$RUNNER_TEMP/source-locked.xml" --extra-revision "$gcc_sha" --sync-manifest "$RUNNER_TEMP/source-sync.xml")
+          echo "gcc_sha=$gcc_sha" >> "$GITHUB_OUTPUT"
+          cp "$RUNNER_TEMP/source-sync.xml" "$DEFAULT_MANIFEST_PATH"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG:-}" >> "$GITHUB_OUTPUT"
+          echo "REMOTE_BRANCH=$REMOTE_BRANCH" >> "$GITHUB_ENV"
+
+      # actions/cache 自动将整个目录压缩为快照，包含 Git 元数据与原配工具链。
+      - name: 恢复未打补丁的源码快照
+        id: source-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.KERNEL_ROOT }}
+          key: source-v1-${{ runner.os }}-${{ steps.source-id.outputs.digest }}-${{ inputs.cache_epoch }}
+
+      - name: 首次同步已锁定的源码和工具链
+        if: steps.source-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          set -euo pipefail
+          # 克隆 GCC 工具链 (用于 5.x 内核)
+          if [ "${{ inputs.kernel_version }}" = "5.10" ] || [ "${{ inputs.kernel_version }}" = "5.15" ]; then
+            git init gcc
+            git -C gcc remote add origin https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git
+            git -C gcc fetch --depth 1 origin "${{ steps.source-id.outputs.gcc_sha }}"
+            git -C gcc checkout --detach FETCH_HEAD
+          fi
+
+          for sync_attempt in 1 2 3; do
+            echo "源码同步：第 ${sync_attempt}/3 次尝试 ($(date -u +%FT%TZ))"
+            if "$REPO" sync -c "-j$(nproc)" --no-tags --fail-fast --verbose; then
+              break
+            fi
+            if [ "$sync_attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep $((sync_attempt * 30))
+          done
+
+      - name: 验证源码提交和子版本
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/source_snapshot.py" "$RUNNER_TEMP/source-locked.xml" --verify-root "$KERNEL_ROOT" --extra-revision "${{ steps.source-id.outputs.gcc_sha }}"
+          if [ -n "${{ steps.source-id.outputs.release_tag }}" ]; then
+            ACTUAL_SUBLEVEL=$(awk '/^SUBLEVEL = / {print $3; exit}' common/Makefile)
+            if [ "$ACTUAL_SUBLEVEL" != "${{ inputs.sub_level }}" ]; then
+              echo "::error::${{ steps.source-id.outputs.release_tag }} 的子版本号为 $ACTUAL_SUBLEVEL，预期为 ${{ inputs.sub_level }}" >&2
+              exit 1
+            fi
+          fi
+
+      # 必须在功能补丁和 defconfig 修改之前保存。
+      - name: 保存未打补丁的源码快照
+        if: steps.source-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.KERNEL_ROOT }}
+          key: ${{ steps.source-cache.outputs.cache-primary-key }}
+
+      # ccache 固定版本键；Bazel 继续滚动保存新增 action 结果。
+      - name: 选择编译缓存
+        id: build-cache
+        run: |
+          if [ -f "$KERNEL_ROOT/build/build.sh" ]; then
+            echo "backend=ccache" >> "$GITHUB_OUTPUT"
+            echo "path=$HOME/.ccache" >> "$GITHUB_OUTPUT"
+          else
+            echo "backend=bazel" >> "$GITHUB_OUTPUT"
+            echo "path=$HOME/.cache/bazel" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 恢复编译缓存
+        id: restore-build-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ steps.build-cache.outputs.path }}
+          key: ${{ steps.build-cache.outputs.backend == 'ccache' && format('{0}-{1}-{2}-{3}', env.CCACHE_KEY, inputs.os_patch_level, inputs.cache_epoch, steps.source-id.outputs.digest) || format('build-v3-{0}-{1}-{2}-{3}-{4}-bazel-{5}-{6}-{7}', runner.os, inputs.android_version, inputs.kernel_version, inputs.sub_level, inputs.os_patch_level, inputs.cache_epoch, github.run_id, github.run_attempt) }}
+          restore-keys: |
+            ${{ steps.build-cache.outputs.backend == 'ccache' && format('{0}-{1}-{2}-', env.CCACHE_KEY, inputs.os_patch_level, inputs.cache_epoch) || 'unused-ccache-key-' }}
+            build-v3-${{ runner.os }}-${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ steps.build-cache.outputs.backend }}-${{ inputs.cache_epoch }}-
+            ${{ inputs.cache_epoch == 'v1' && format('build-v2-{0}-{1}-{2}-{3}-{4}-{5}-', runner.os, inputs.android_version, inputs.kernel_version, inputs.sub_level, inputs.os_patch_level, steps.build-cache.outputs.backend) || 'no-legacy-cache-' }}
+            ${{ inputs.cache_epoch == 'v1' && steps.build-cache.outputs.backend == 'ccache' && format('{0}-{1}-{2}-ccache-', inputs.android_version, inputs.kernel_version, inputs.sub_level) || 'legacy-bazel-cache-unavailable-' }}
+
+      - name: 配置 ccache 并重置本次统计
+        if: steps.build-cache.outputs.backend == 'ccache'
+        run: |
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          export CCACHE_DIR="$HOME/.ccache"
+          mkdir -p "$CCACHE_DIR"
+          ccache --version
+          ccache --max-size=2G
+          ccache --set-config=compression=true
+          ccache --zero-stats
+
+      - name: 恢复 ThinLTO 链接缓存
+        id: thinlto-cache
+        if: steps.build-cache.outputs.backend == 'ccache'
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.cache/gki-thinlto
+          key: thinlto-v1-${{ runner.os }}-${{ steps.source-id.outputs.digest }}-${{ inputs.cache_epoch }}
+
+      - name: 配置持久化 ThinLTO 缓存
+        if: steps.build-cache.outputs.backend == 'ccache'
+        run: |
+          mkdir -p "$HOME/.cache/gki-thinlto"
+          python3 "$GITHUB_WORKSPACE/scripts/configure_thinlto.py" "$KERNEL_ROOT/common/Makefile" "$HOME/.cache/gki-thinlto"
 
       # ==================== 伪装 /proc/config.gz（自动检测） ====================
       # 若仓库存在 config/stock_defconfig，则自动应用；不存在则跳过
@@ -476,6 +587,33 @@ jobs:
             echo "::error::未在 $TARGET_MAKEFILE 找到规则: $OLD_RULE"
             exit 1
           fi
+
+      # ==================== 伪装 /proc/config.gz（自动过滤版, 仅 5.10） ====================
+      # 仅针对 android12-5.10:不改汇报内容来源,
+      # 仅在生成 config_data 时 sed 过滤掉 FCM 撞线的配置项(如 SYSVIPC),
+      # 汇报值始终是真实构建配置,无需维护整份 stock_defconfig
+      - name: 应用 Stock Config 伪装(自动过滤)
+        if: inputs.clean_build != true && inputs.kernel_version == '5.10'
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/config/stock_defconfig" ]; then
+            echo "已存在 config/stock_defconfig,由整文件伪装接管,跳过自动过滤。"
+            exit 0
+          fi
+          python3 - <<'PYEOF'
+          p = 'kernel/Makefile'
+          s = open(p).read()
+          old = 'filechk_cat = cat $<'
+          new = ("filechk_cat = sed -e 's/^CONFIG_SYSVIPC=y/\\# CONFIG_SYSVIPC is not set/'"
+                 " -e '/^CONFIG_SYSVIPC_SYSCTL=y/d' -e '/^CONFIG_SYSVIPC_COMPAT=y/d' $<")
+          if new in s:
+              print('filechk_cat 已是过滤版,跳过。')
+          elif old in s:
+              open(p, 'w').write(s.replace(old, new, 1))
+              print('已将 filechk_cat 替换为过滤版。')
+          else:
+              raise SystemExit('::error::未在 kernel/Makefile 找到规则: ' + old)
+          PYEOF
 
       # ==================== 提取实际子版本号 ====================
       # 从 Makefile 中读取真实的 SUBLEVEL 值
@@ -1690,6 +1828,32 @@ jobs:
           fi
           cp "$SRC_DIR/Image" ./Bypass-Image
 
+      - name: 报告本次 ccache 命中情况
+        if: always() && steps.build-cache.outputs.backend == 'ccache'
+        run: |
+          export CCACHE_DIR="$HOME/.ccache"
+          ccache --show-stats --verbose | tee "$RUNNER_TEMP/ccache-stats.txt"
+          {
+            echo '### 本次 ccache 统计（包含普通和 Bypass 构建）'
+            echo '```text'
+            cat "$RUNNER_TEMP/ccache-stats.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 保存编译缓存
+        if: success() && steps.restore-build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ steps.build-cache.outputs.path }}
+          key: ${{ steps.restore-build-cache.outputs.cache-primary-key }}
+
+      - name: 保存 ThinLTO 链接缓存
+        if: success() && steps.build-cache.outputs.backend == 'ccache' && steps.thinlto-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.cache/gki-thinlto
+          key: ${{ steps.thinlto-cache.outputs.cache-primary-key }}
+
       # ==================== 创建 AnyKernel3 压缩包 ====================
       - name: 创建 AnyKernel3 压缩包
         run: |
@@ -1708,63 +1872,66 @@ jobs:
 
       # ==================== 构建 Boot 镜像 (Android 12) ====================
       # Android 12 需要从 GKI 认证镜像中提取 ramdisk
-#      - name: 构建 Boot 镜像 (Android 12)
-#        if: inputs.android_version == 'android12'
-#        working-directory: bootimgs
-#        run: |
-#          GKI_URL=https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-${{ inputs.os_patch_level }}_${{ inputs.revision }}.zip
-#          FALLBACK_URL=https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-2023-01_r1.zip
-#
-#          status=$(curl -sL -w "%{http_code}" "$GKI_URL" -o /dev/null)
-#          if [ "$status" = "200" ]; then
-#            curl -Lo gki-kernel.zip "$GKI_URL"
-#          else
-#            curl -Lo gki-kernel.zip "$FALLBACK_URL"
-#          fi
-#
-#          unzip gki-kernel.zip && rm gki-kernel.zip
-#          $UNPACK_BOOTIMG --boot_img="$(pwd)/boot-5.10.img"
-#
-#          gzip -n -k -f -9 ./Image > ./Image.gz
-#
-#         # 创建普通 boot.img
-#          $MKBOOTIMG --header_version 4 --kernel Image --output boot.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
-#          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-#          cp ./boot.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot.img
-#
-#          # 创建 gzip 压缩的 boot.img
-#          $MKBOOTIMG --header_version 4 --kernel Image.gz --output boot-gz.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
-#          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-gz.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-#          cp ./boot-gz.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot-gz.img
-#
-#          # 创建 lz4 压缩的 boot.img
-#          $MKBOOTIMG --header_version 4 --kernel Image.lz4 --output boot-lz4.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
-#          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-#          cp ./boot-lz4.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot-lz4.img
-#
-#      # ==================== 构建 Boot 镜像 (Android 13+) ====================
-#      # Android 13 及以上版本不需要 ramdisk
-#      - name: 构建 Boot 镜像 (Android 13+)
-#        if: inputs.android_version == 'android13' || inputs.android_version == 'android14' || inputs.android_version == 'android15' || inputs.android_version == 'android16'
-#        working-directory: bootimgs
-#        run: |
-#          gzip -n -k -f -9 ./Image > ./Image.gz
-#
-#          # 创建普通 boot.img
-#          $MKBOOTIMG --header_version 4 --kernel Image --output boot.img
-#          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-#          cp ./boot.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot.img
-#
-#          # 创建 gzip 压缩的 boot.img
-#          $MKBOOTIMG --header_version 4 --kernel Image.gz --output boot-gz.img
-#          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-gz.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-#          cp ./boot-gz.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot-gz.img
-#
-#          # 创建 lz4 压缩的 boot.img
-#          $MKBOOTIMG --header_version 4 --kernel Image.lz4 --output boot-lz4.img
-#          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-#          cp ./boot-lz4.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot-lz4.img
-#
+      - name: 构建 Boot 镜像 (Android 12)
+        if: inputs.android_version == 'android12'
+        working-directory: ${{ env.KERNEL_ROOT }}/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist
+        run: |
+          GKI_URL=https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-${{ inputs.os_patch_level }}_${{ inputs.revision }}.zip
+          FALLBACK_URL=https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-2023-01_r1.zip
+
+          status=$(curl -sL -w "%{http_code}" "$GKI_URL" -o /dev/null)
+          if [ "$status" = "200" ]; then
+            curl -Lo gki-kernel.zip "$GKI_URL"
+          else
+            curl -Lo gki-kernel.zip "$FALLBACK_URL"
+          fi
+
+          unzip gki-kernel.zip && rm gki-kernel.zip
+          $UNPACK_BOOTIMG --boot_img="$(pwd)/boot-5.10.img"
+
+          gzip -n -k -f -9 ./Image > ./Image.gz
+          PREFIX="${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}"
+          
+          # 创建普通 boot.img
+          $MKBOOTIMG --header_version 4 --kernel Image --output boot.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
+          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+          cp ./boot.img $GITHUB_WORKSPACE/${PREFIX}-boot.img
+
+          # 创建 gzip 压缩的 boot.img
+          $MKBOOTIMG --header_version 4 --kernel Image.gz --output boot-gz.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
+          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-gz.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+          cp ./boot-gz.img $GITHUB_WORKSPACE/${PREFIX}-boot-gz.img
+
+          # 创建 lz4 压缩的 boot.img
+          $MKBOOTIMG --header_version 4 --kernel Image.lz4 --output boot-lz4.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
+          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+          cp ./boot-lz4.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot-lz4.img
+          cp ./boot-lz4.img $GITHUB_WORKSPACE/${PREFIX}-boot-lz4.img
+
+      # ==================== 构建 Boot 镜像 (Android 13+) ====================
+      # Android 13 及以上版本不需要 ramdisk
+      - name: 构建 Boot 镜像 (Android 13+)
+        if: inputs.android_version == 'android13' || inputs.android_version == 'android14' || inputs.android_version == 'android15' || inputs.android_version == 'android16'
+        working-directory: ${{ inputs.android_version == 'android13' && format('{0}/out/{1}-{2}/dist', env.KERNEL_ROOT, inputs.android_version, inputs.kernel_version) || 'bootimgs' }}
+        run: |
+          gzip -n -k -f -9 ./Image > ./Image.gz
+          PREFIX="${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}"
+
+          # 创建普通 boot.img
+          $MKBOOTIMG --header_version 4 --kernel Image --output boot.img
+          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+          cp ./boot.img $GITHUB_WORKSPACE/${PREFIX}-boot.img
+
+          # 创建 gzip 压缩的 boot.img
+          $MKBOOTIMG --header_version 4 --kernel Image.gz --output boot-gz.img
+          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-gz.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+          cp ./boot-gz.img $GITHUB_WORKSPACE/${PREFIX}-boot-gz.img
+
+          # 创建 lz4 压缩的 boot.img
+          $MKBOOTIMG --header_version 4 --kernel Image.lz4 --output boot-lz4.img
+          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+          cp ./boot-lz4.img $GITHUB_WORKSPACE/${PREFIX}-boot-lz4.img
+
       # ==================== 收集补丁冲突文件 ====================
       # 收集所有 .rej 文件用于调试补丁失败问题
       - name: 收集补丁冲突文件
@@ -1802,7 +1969,7 @@ jobs:
           name: ${{ env.BUILD_VARIANT }}_kernel-${{ env.CONFIG }}
           path: |
             *AnyKernel3.zip
-#            *.img
+            *.img
           compression-level: 0
 
       # ==================== 上传补丁冲突文件 ====================
