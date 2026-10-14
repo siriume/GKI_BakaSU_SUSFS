@@ -19,7 +19,7 @@ on:
   workflow_call:
     inputs:
       cache_epoch:
-        description: "缓存版本；需要刷新源码/编译缓存时改为新值，如 v2"
+        description: "源码归档/编译缓存版本；需要强制刷新时改为新值，如 v2"
         required: false
         type: string
         default: "v1"
@@ -238,13 +238,6 @@ jobs:
           SUSFS_LATEST_COMMIT_DATE=未启用
           EOF
 
-          # 下载并配置 repo 工具 (用于同步 Android 内核源码)
-          mkdir -p "$GITHUB_WORKSPACE/git-repo"
-          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o "$GITHUB_WORKSPACE/git-repo/repo"
-          chmod 0755 "$GITHUB_WORKSPACE/git-repo/repo"
-          echo "$GITHUB_WORKSPACE/git-repo" >> "$GITHUB_PATH"
-          echo "REPO=$GITHUB_WORKSPACE/git-repo/repo" >> $GITHUB_ENV
-
       # ==================== 显示配置文件内容 ====================
       - name: 显示配置信息
         run: |
@@ -259,7 +252,7 @@ jobs:
       - name: 安装编译依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y ccache python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves
+          sudo apt-get install -y ccache zstd python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves
 
       # ==================== 缓存工具链 ====================
       # 缓存 AOSP 构建工具，避免每次重新下载
@@ -359,139 +352,19 @@ jobs:
           echo "使用当前仓库补丁目录: $ZZH_PATCHES"
           git clone https://github.com/Numbersf/Action-Build.git --depth=1
 
-      # ==================== 初始化并同步内核源码 ====================
-      # 使用 repo 工具从 AOSP 获取 GKI 内核源码
-      - name: 解析并锁定源码版本
+      # 在任何功能补丁之前恢复/保存 Release 中的原始源码。
+      - name: 从 Release 获取或保存源码快照
         id: source-id
-        working-directory: ${{ env.KERNEL_ROOT }}
-        run: |
-          retry() {
-            local max_attempts="$1"
-            local base_delay="$2"
-            shift 2
-
-            local attempt=1
-            until "$@"; do
-              if [ "$attempt" -ge "$max_attempts" ]; then
-                echo "::error::命令在 $max_attempts 次尝试后仍失败: $*" >&2
-                return 1
-              fi
-
-              local delay=$((base_delay * attempt))
-              echo "::warning::命令执行失败，${delay} 秒后重试 ($attempt/$max_attempts): $*" >&2
-              sleep "$delay"
-              attempt=$((attempt + 1))
-            done
-          }
-
-          FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}"
-          echo "初始化 repo，分支: common-${FORMATTED_BRANCH}"
-
-          retry 4 15 "$REPO" init --depth=1 -u https://android.googlesource.com/kernel/manifest -b "common-${FORMATTED_BRANCH}" --repo-rev=v2.16
-
-          # 检查是否为已弃用的分支
-          REMOTE_BRANCH=$(retry 4 15 git ls-remote --heads https://android.googlesource.com/kernel/common "refs/heads/${FORMATTED_BRANCH}")
-          DEFAULT_MANIFEST_PATH=.repo/manifests/default.xml
-
-          if [ -n "${{ inputs.revision }}" ] && [ "${{ inputs.os_patch_level }}" != "lts" ]; then
-            RELEASE_TAG="${FORMATTED_BRANCH}_${{ inputs.revision }}"
-            TAG_REF=$(retry 4 15 git ls-remote --tags --refs https://android.googlesource.com/kernel/common "refs/tags/${RELEASE_TAG}")
-            if [ -z "$TAG_REF" ]; then
-              echo "::error::未找到 JSON 指定的发布 tag: $RELEASE_TAG" >&2
-              exit 1
-            fi
-            sed -i "s|revision=\"${FORMATTED_BRANCH}\"|revision=\"refs/tags/${RELEASE_TAG}\"|" "$DEFAULT_MANIFEST_PATH"
-            if ! grep -qF "revision=\"refs/tags/${RELEASE_TAG}\"" "$DEFAULT_MANIFEST_PATH"; then
-              echo "::error::未能在 manifest 中设置 kernel/common 的发布 tag" >&2
-              exit 1
-            fi
-          elif [ -z "$REMOTE_BRANCH" ] && [ -n "$(retry 4 15 git ls-remote --heads https://android.googlesource.com/kernel/common "refs/heads/deprecated/${FORMATTED_BRANCH}")" ]; then
-            echo "检测到已弃用的分支: $FORMATTED_BRANCH"
-            sed -i "s/\"${FORMATTED_BRANCH}\"/\"deprecated\/${FORMATTED_BRANCH}\"/g" $DEFAULT_MANIFEST_PATH
-          elif [ -z "$REMOTE_BRANCH" ]; then
-            # 上游可能删除日期分支，但仍保留该月份的发布 tag。
-            TAG_REFS=$(retry 4 15 git ls-remote --tags --refs https://android.googlesource.com/kernel/common "refs/tags/${FORMATTED_BRANCH}_r*")
-            if [ -z "$TAG_REFS" ]; then
-              echo "::error::未找到 $FORMATTED_BRANCH 分支或对应的发布 tag" >&2
-              exit 1
-            fi
-            RELEASE_TAG=$(printf '%s\n' "$TAG_REFS" | awk '{print $2}' | sed 's|^refs/tags/||' | sort -V | tail -n1)
-            echo "分支已删除，改用发布 tag: $RELEASE_TAG"
-            sed -i "s|revision=\"${FORMATTED_BRANCH}\"|revision=\"refs/tags/${RELEASE_TAG}\"|" "$DEFAULT_MANIFEST_PATH"
-            if ! grep -qF "revision=\"refs/tags/${RELEASE_TAG}\"" "$DEFAULT_MANIFEST_PATH"; then
-              echo "::error::未能在 manifest 中设置 kernel/common 的发布 tag" >&2
-              exit 1
-            fi
-          fi
-
-          "$REPO" manifest -o "$RUNNER_TEMP/source-manifest.xml"
-          gcc_sha=""
-          if [ "${{ inputs.kernel_version }}" = "5.10" ] || [ "${{ inputs.kernel_version }}" = "5.15" ]; then
-            gcc_sha=$(retry 4 15 git ls-remote https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git HEAD | awk '{print $1}')
-            if [[ ! "$gcc_sha" =~ ^[a-fA-F0-9]{40}$ ]]; then
-              echo "::error::无法锁定额外 GCC 工具链提交"
-              exit 1
-            fi
-          fi
-          digest=$(python3 "$GITHUB_WORKSPACE/scripts/source_snapshot.py" "$RUNNER_TEMP/source-manifest.xml" "$RUNNER_TEMP/source-locked.xml" --extra-revision "$gcc_sha" --sync-manifest "$RUNNER_TEMP/source-sync.xml")
-          echo "gcc_sha=$gcc_sha" >> "$GITHUB_OUTPUT"
-          cp "$RUNNER_TEMP/source-sync.xml" "$DEFAULT_MANIFEST_PATH"
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-          echo "release_tag=${RELEASE_TAG:-}" >> "$GITHUB_OUTPUT"
-          echo "REMOTE_BRANCH=$REMOTE_BRANCH" >> "$GITHUB_ENV"
-
-      # actions/cache 自动将整个目录压缩为快照，包含 Git 元数据与原配工具链。
-      - name: 恢复未打补丁的源码快照
-        id: source-cache
-        uses: actions/cache/restore@v5
+        uses: ./.github/actions/source-release
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          path: ${{ env.KERNEL_ROOT }}
-          key: source-v1-${{ runner.os }}-${{ steps.source-id.outputs.digest }}-${{ inputs.cache_epoch }}
-
-      - name: 首次同步已锁定的源码和工具链
-        if: steps.source-cache.outputs.cache-hit != 'true'
-        working-directory: ${{ env.KERNEL_ROOT }}
-        run: |
-          set -euo pipefail
-          # 克隆 GCC 工具链 (用于 5.x 内核)
-          if [ "${{ inputs.kernel_version }}" = "5.10" ] || [ "${{ inputs.kernel_version }}" = "5.15" ]; then
-            git init gcc
-            git -C gcc remote add origin https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git
-            git -C gcc fetch --depth 1 origin "${{ steps.source-id.outputs.gcc_sha }}"
-            git -C gcc checkout --detach FETCH_HEAD
-          fi
-
-          for sync_attempt in 1 2 3; do
-            echo "源码同步：第 ${sync_attempt}/3 次尝试 ($(date -u +%FT%TZ))"
-            if "$REPO" sync -c "-j$(nproc)" --no-tags --fail-fast --verbose; then
-              break
-            fi
-            if [ "$sync_attempt" -eq 3 ]; then
-              exit 1
-            fi
-            sleep $((sync_attempt * 30))
-          done
-
-      - name: 验证源码提交和子版本
-        working-directory: ${{ env.KERNEL_ROOT }}
-        run: |
-          set -euo pipefail
-          python3 "$GITHUB_WORKSPACE/scripts/source_snapshot.py" "$RUNNER_TEMP/source-locked.xml" --verify-root "$KERNEL_ROOT" --extra-revision "${{ steps.source-id.outputs.gcc_sha }}"
-          if [ -n "${{ steps.source-id.outputs.release_tag }}" ]; then
-            ACTUAL_SUBLEVEL=$(awk '/^SUBLEVEL = / {print $3; exit}' common/Makefile)
-            if [ "$ACTUAL_SUBLEVEL" != "${{ inputs.sub_level }}" ]; then
-              echo "::error::${{ steps.source-id.outputs.release_tag }} 的子版本号为 $ACTUAL_SUBLEVEL，预期为 ${{ inputs.sub_level }}" >&2
-              exit 1
-            fi
-          fi
-
-      # 必须在功能补丁和 defconfig 修改之前保存。
-      - name: 保存未打补丁的源码快照
-        if: steps.source-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
-        with:
-          path: ${{ env.KERNEL_ROOT }}
-          key: ${{ steps.source-cache.outputs.cache-primary-key }}
+          android_version: ${{ inputs.android_version }}
+          kernel_version: ${{ inputs.kernel_version }}
+          sub_level: ${{ inputs.sub_level }}
+          os_patch_level: ${{ inputs.os_patch_level }}
+          revision: ${{ inputs.revision }}
+          cache_epoch: ${{ inputs.cache_epoch }}
 
       # ccache 固定版本键；Bazel 继续滚动保存新增 action 结果。
       - name: 选择编译缓存

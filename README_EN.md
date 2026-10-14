@@ -63,7 +63,7 @@ Selection rules:
 - 5.15: `kernel_android_version` must be `android13` or `android14`.
 - 6.1, 6.6, 6.12, and 6.18: the workflow uses the Android 14, 15, 16, and 17 KMIs respectively, with no manual selection required.
 
-Patch levels, release revisions, and LTS versions are read from the corresponding JSON data. A specific-version build does not create a GitHub Release, even when `release_type` is set to `Pre-Release` or `Release`.
+Patch levels, release revisions, and LTS versions are read from the corresponding JSON data. A specific-version build does not publish a kernel binary Release, even when `release_type` is set to `Pre-Release` or `Release`. Pristine source archives are still saved to source Releases in the current repository as needed.
 
 ### Release Types
 
@@ -74,6 +74,12 @@ The following `release_type` options are available for regular version builds:
 - `Release`: Create a full release after a successful build in this repository.
 
 Forks only produce workflow artifacts and never publish a Release to the upstream repository.
+
+## Source Releases
+
+Builds restore pristine sources from Releases such as `source-android13-5.15`, instead of storing entire source trees in Actions cache. Fixed monthly targets reuse their first complete snapshot. LTS snapshots are keyed by all manifest project commits and the extra GCC revision. The extra GCC toolchain is shared through `source-toolchains`.
+
+The **更新源码 Release** workflow checks configured versions daily at 19:00 UTC and after successful GKI data updates. It can also be dispatched manually for a source group, with `configured` or `lts` targets. It synchronizes and archives sources without compiling kernels, and skips downloading existing complete archives. See [source archive details](docs/source-releases.md).
 
 ## BakaSU Branch
 

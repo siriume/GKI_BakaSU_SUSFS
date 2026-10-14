@@ -1,0 +1,112 @@
+name: 更新源码 Release
+
+on:
+  schedule:
+    - cron: '0 19 * * *'  # 每天北京时间 03:00
+  workflow_run:
+    workflows: ['更新 GKI 版本数据']
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      source_group:
+        description: '源码分组，例如 android13-5.15；all 表示全部 JSON 已配置版本'
+        type: choice
+        default: all
+        options:
+          - all
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+      targets:
+        description: 'configured=全部已配置版本；lts=仅滚动 LTS'
+        type: choice
+        default: configured
+        options: [configured, lts]
+      cache_epoch:
+        description: '源码归档版本，须与内核构建使用的版本一致'
+        type: string
+        default: v1
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-source-releases
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: 读取现有版本配置
+        id: matrix
+        env:
+          SOURCE_GROUP: ${{ inputs.source_group || 'all' }}
+          SOURCE_TARGETS: ${{ inputs.targets || 'configured' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          from prepare_matrix import build_matrix, validate_data
+          matrix = []
+          for path in sorted(Path('data').glob('android*/*.json')):
+              group = f'{path.parent.name}-{path.stem}'
+              if os.environ['SOURCE_GROUP'] not in ('all', group):
+                  continue
+              data = json.loads(path.read_text())
+              validate_data(data, str(path), path.parent.name, path.stem)
+              for target in build_matrix(data, deduplicate_sublevels=True):
+                  if os.environ['SOURCE_TARGETS'] == 'lts' and target['os_patch_level'] != 'lts':
+                      continue
+                  matrix.append(target)
+          if not matrix or len(matrix) > 256:
+              raise SystemExit(f'Invalid source matrix size: {len(matrix)}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('matrix=' + json.dumps(matrix, separators=(',', ':')) + '\n')
+          print(json.dumps(matrix, indent=2))
+          PY
+
+  archive:
+    name: 源码 ${{ matrix.android_version }}-${{ matrix.kernel_version }}.${{ matrix.sub_level }}-${{ matrix.os_patch_level }}-${{ matrix.revision }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: 准备归档工具和空间
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
+          available_kib=$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')
+          if [ "$available_kib" -lt $((50 * 1024 * 1024)) ]; then
+            sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/share/swift
+          fi
+          df -h "$GITHUB_WORKSPACE"
+      - name: 更新未打补丁的源码归档
+        uses: ./.github/actions/source-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          android_version: ${{ matrix.android_version }}
+          kernel_version: ${{ matrix.kernel_version }}
+          sub_level: ${{ matrix.sub_level }}
+          os_patch_level: ${{ matrix.os_patch_level }}
+          revision: ${{ matrix.revision }}
+          cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
+          update_only: 'true'

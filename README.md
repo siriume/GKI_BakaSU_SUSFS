@@ -59,7 +59,7 @@
 - 5.15：必须选 `android13` 或 `android14`。
 - 6.1、6.6、6.12、6.18：工作流分别使用 Android 14、15、16、17 的 KMI，无需手动选择。
 
-补丁级别、发布 revision 和 LTS 版本由对应 JSON 数据读取。指定版本构建不会创建 GitHub Release，即使 `release_type` 选择了预发布或正式发布。
+补丁级别、发布 revision 和 LTS 版本由对应 JSON 数据读取。指定版本构建不会发布内核产物 Release，即使 `release_type` 选择了预发布或正式发布；原始源码归档仍会按需保存至本仓库的源码 Release。
 
 ### 发布类型
 
@@ -70,6 +70,14 @@
 - `Release`：在本仓库构建成功后创建正式发布。
 
 Fork 仓库只生成 Actions 产物，不会向上游仓库发布 Release。
+
+## 源码 Release
+
+构建优先从本仓库的 `source-android13-5.15` 等 Release 获取未打补丁的源码，不再使用 Actions cache 保存整套源码。固定月份/revision 首次归档后复用；LTS 按整份 manifest 和 GCC 提交的摘要更新。额外 GCC 工具链存放在 `source-toolchains`，供多个内核版本共用。
+
+独立工作流 **更新源码 Release** 每天北京时间 03:00 检查归档，也会在版本数据更新成功后运行。可手动选择 `android13-5.15` 等分组和 `configured`（全部已配置版本）或 `lts`（仅 LTS）；只同步、压缩源码，不编译内核。已存在的归档只检查索引，不重复下载。
+
+首次使用可先手动运行该工作流，为所需分组准备归档。详细命名、分卷和刷新规则见 [源码归档说明](docs/source-releases.md)。
 
 ## BakaSU 分支
 

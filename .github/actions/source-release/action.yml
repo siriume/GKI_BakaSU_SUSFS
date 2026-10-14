@@ -1,0 +1,46 @@
+name: GKI source Release
+description: Restore or publish pristine, commit-locked GKI sources and shared GCC toolchains
+inputs:
+  android_version:
+    required: true
+    description: Android kernel platform
+  kernel_version:
+    required: true
+    description: Kernel major.minor
+  sub_level:
+    required: true
+    description: Configured kernel sublevel
+  os_patch_level:
+    required: true
+    description: Release month or lts
+  revision:
+    default: ''
+    description: Optional release respin, such as r9
+  cache_epoch:
+    default: v1
+    description: Source archive generation
+  update_only:
+    default: 'false'
+    description: Skip downloading complete archives when only updating Releases
+outputs:
+  digest:
+    description: SHA256 of the full locked source manifest and GCC revision
+    value: ${{ steps.snapshot.outputs.digest }}
+  hit:
+    description: Whether the pristine source archive was restored
+    value: ${{ steps.snapshot.outputs.hit }}
+runs:
+  using: composite
+  steps:
+    - name: 从 Release 获取或更新源码
+      id: snapshot
+      shell: bash
+      env:
+        SOURCE_ANDROID: ${{ inputs.android_version }}
+        SOURCE_KERNEL: ${{ inputs.kernel_version }}
+        SOURCE_SUBLEVEL: ${{ inputs.sub_level }}
+        SOURCE_PATCH: ${{ inputs.os_patch_level }}
+        SOURCE_REVISION: ${{ inputs.revision }}
+        SOURCE_EPOCH: ${{ inputs.cache_epoch }}
+        SOURCE_UPDATE_ONLY: ${{ inputs.update_only }}
+      run: bash "$GITHUB_WORKSPACE/scripts/source_release.sh"
