@@ -37,6 +37,12 @@ class MemoryStore:
 
 
 class SourceReleaseTests(unittest.TestCase):
+    def test_default_variant_is_lightweight_and_part_limit_is_199_gib(self):
+        self.assertEqual(source_release.variant_index('fixed-v1.json'), 'fixed-v1-no-history-v2.json')
+        self.assertEqual(source_release.variant_index('fixed-v1.json', True), 'fixed-v1.json')
+        self.assertEqual(source_release.PART_LIMIT, 2136746229)
+        self.assertLess(source_release.PART_LIMIT, 2 * 1024**3)
+
     def test_fixed_and_lts_names_do_not_collide(self):
         self.assertEqual(source_release.target_name('android13', '5.15', '123', '2023-11', 'r9'),
                          'android13-5.15.123-2023-11-r9')
@@ -355,13 +361,19 @@ if a[0] == 'api':
         print(json.dumps({'id': a[1].rsplit('/', 1)[1]}))
     else:
         tag = a[1].split('/releases/')[1].split('/')[0]
-        print(json.dumps([[{'name': p.name} for p in (releases / tag).iterdir()]]))
+        print(json.dumps([[{'name': p.name, 'size': p.stat().st_size} for p in (releases / tag).iterdir()]]))
 elif a[:2] == ['release', 'download']:
     name = a[a.index('--pattern') + 1]
     if os.environ.get('NO_PAYLOAD_DOWNLOAD') and not name.endswith('.json'):
         raise SystemExit('Updater downloaded an existing payload')
     destination = Path(a[a.index('--dir') + 1]) / name
     shutil.copyfile(releases / a[2] / name, destination)
+elif a[:2] == ['release', 'upload']:
+    source = Path(a[3])
+    destination = releases / a[2] / source.name
+    if destination.exists():
+        raise SystemExit('Asset already exists')
+    shutil.copyfile(source, destination)
 else:
     raise SystemExit('Unexpected GitHub operation: ' + repr(a))
 ''')
@@ -385,11 +397,35 @@ else:
             self.assertIn('hit=true', (work / 'outputs').read_text())
             self.assertIn('digest=' + metadata['digest'], (work / 'outputs').read_text())
             self.assertTrue((workspace / 'android13-5.15-123' / 'common' / 'link').is_symlink())
+            # The first run converts the complete old Release into the new
+            # default format; the next run restores that lightweight archive.
+            lightweight_index = releases / 'source-android13-5.15' / (target + '-v1-no-history-v2.json')
+            self.assertTrue(lightweight_index.exists())
+            self.assertEqual(json.loads(lightweight_index.read_text())['git_seed_version'], 1)
+            shutil.rmtree(workspace / 'android13-5.15-123')
+            result = subprocess.run(['bash', str(scripts / 'source_release.sh')],
+                env=environment, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse((workspace / 'android13-5.15-123' / '.repo').exists())
+            self.assertTrue((workspace / 'android13-5.15-123' / 'common' / '.git').is_dir())
+            self.assertFalse((workspace / 'android13-5.15-123' / 'common' / '.git').is_symlink())
+            self.assertEqual(head(workspace / 'android13-5.15-123' / 'common'), head(root / 'common'))
             environment.update(SOURCE_UPDATE_ONLY='true', NO_PAYLOAD_DOWNLOAD='true')
             result = subprocess.run(['bash', str(scripts / 'source_release.sh')],
                 env=environment, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('skipping download', result.stdout)
+            # The checkbox opts back into the full-metadata index.
+            full_workspace = work / 'full-workspace'
+            full_workspace.mkdir()
+            (full_workspace / 'scripts').symlink_to(scripts, target_is_directory=True)
+            environment.update(GITHUB_WORKSPACE=str(full_workspace), SOURCE_UPDATE_ONLY='false',
+                               SOURCE_INCLUDE_HISTORY='true')
+            environment.pop('NO_PAYLOAD_DOWNLOAD')
+            result = subprocess.run(['bash', str(scripts / 'source_release.sh')],
+                env=environment, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((full_workspace / 'android13-5.15-123' / '.repo').is_dir())
 
 
 if __name__ == '__main__':

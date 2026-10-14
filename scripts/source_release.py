@@ -15,8 +15,9 @@ import time
 import uuid
 
 from source_snapshot import verify_checkout
+from source_git_seed import BUNDLE, create_seed_bundle, restore_seed_bundle
 
-PART_LIMIT = 1900 * 1024 * 1024  # Each asset stays below GitHub's 2 GiB limit.
+PART_LIMIT = 199 * 1024**3 // 100  # 1.99 GiB, strictly below GitHub's 2 GiB limit.
 SAFE_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,230}$')
 
 
@@ -49,6 +50,11 @@ def index_name(target, epoch, digest):
 
 def manifest_digest(locked, gcc_sha):
     return hashlib.sha256((locked + gcc_sha.lower()).encode()).hexdigest()
+
+
+def variant_index(marker, include_history=False):
+    # v2 distinguishes usable lightweight snapshots from earlier size experiments.
+    return marker if include_history else marker.removesuffix('.json') + '-no-history-v2.json'
 
 
 def validate_identity(metadata, expected_digest=''):
@@ -142,6 +148,10 @@ class ReleaseStore:
                         f'repos/{self.repository}/releases/assets/{asset["id"]}', missing_ok=True)
                 return
 
+    def has_parts(self, parts):
+        available = {asset['name']: asset['size'] for asset in self.assets()}
+        return bool(parts) and all(available.get(part['name']) == part['size'] for part in parts)
+
 
 def split_stream(stream, work, prefix, limit=PART_LIMIT):
     parts = []
@@ -171,7 +181,7 @@ def split_stream(stream, work, prefix, limit=PART_LIMIT):
     return parts
 
 
-def archive_tree(root, work, prefix, exclude_gcc=False, exclude_history=False):
+def archive_tree(root, work, prefix, exclude_gcc=False, exclude_history=False, seed_git=False):
     command = ['tar', '-C', str(root)]
     if exclude_gcc:
         command += ['--exclude=./gcc']
@@ -180,6 +190,9 @@ def archive_tree(root, work, prefix, exclude_gcc=False, exclude_history=False):
         # Keep ordinary versioned files such as .gitignore and .gitmodules.
         command += ['--exclude=.repo', '--exclude=.git']
     command += ['-cf', '-', '.']
+    if seed_git:
+        create_seed_bundle(root, work / BUNDLE, exclude_gcc)
+        command += ['-C', str(work), BUNDLE]
     # Never print binary archive data. Both subprocesses must finish successfully.
     with subprocess.Popen(command, stdout=subprocess.PIPE) as tar:
         with subprocess.Popen(['zstd', '-T0', '-6', '-c'], stdin=tar.stdout,
@@ -241,7 +254,8 @@ def discard_unreferenced_uploads(store, parts, winner):
                 print(f'Could not remove redundant upload {part["name"]}: {error}', file=sys.stderr)
 
 
-def publish_archive(store, root, marker, metadata, exclude_gcc=False, exclude_history=False):
+def publish_archive(store, root, marker, metadata, exclude_gcc=False, exclude_history=False,
+                    seed_git=False):
     existing = store.read_metadata(marker)
     if existing is not None:
         return existing
@@ -256,7 +270,9 @@ def publish_archive(store, root, marker, metadata, exclude_gcc=False, exclude_hi
         if metadata.get('digest') and metadata['digest'] not in prefix:
             prefix += '-' + metadata['digest'][:16]
         prefix += '-' + uuid.uuid4().hex[:12]
-        if exclude_history:
+        if seed_git:
+            parts = archive_tree(root, work, prefix, exclude_gcc, exclude_history=True, seed_git=True)
+        elif exclude_history:
             parts = archive_tree(root, work, prefix, exclude_gcc, exclude_history=True)
         else:
             parts = archive_tree(root, work, prefix, exclude_gcc)
@@ -292,6 +308,27 @@ def publish_archive(store, root, marker, metadata, exclude_gcc=False, exclude_hi
 def extract_archive(archive, destination):
     destination.mkdir(parents=True, exist_ok=True)
     subprocess.run(['tar', '--zstd', '-xf', str(archive), '-C', str(destination)], check=True)
+
+
+def publish_snapshot(store, gcc_store, root, marker, metadata, include_history=False):
+    validate_identity(metadata)
+    verify_checkout(metadata['locked'], root, metadata['gcc_sha'])
+    exported = {key: value for key, value in metadata.items() if key != 'parts'}
+    exported['git_metadata'] = include_history
+    if not include_history:
+        exported['git_seed_version'] = 1
+    gcc_sha = metadata['gcc_sha']
+    if gcc_sha:
+        gcc_marker = variant_index(f'gcc-{gcc_sha}-v1.json', include_history)
+        gcc_metadata = {'schema': 1, 'gcc_sha': gcc_sha, 'git_metadata': include_history}
+        if not include_history:
+            gcc_metadata['git_seed_version'] = 1
+        publish_archive(gcc_store, root / 'gcc', gcc_marker, gcc_metadata,
+                        exclude_history=not include_history, seed_git=not include_history)
+        exported['gcc_index'] = gcc_marker
+    return publish_archive(store, root, variant_index(marker, include_history), exported,
+                           exclude_gcc=True, exclude_history=not include_history,
+                           seed_git=not include_history)
 
 
 def compare_without_history(store, gcc_store, marker, root):
@@ -350,12 +387,13 @@ def restore_snapshot(store, gcc_store, marker, root, locked_path, expected_diges
         print(f'Release archive not found: {store.tag if isinstance(store, ReleaseStore) else "test"}/{marker}')
         return None
     validate_identity(metadata, expected_digest)
-    if metadata.get('git_metadata') is False:
+    if metadata.get('git_metadata') is False and metadata.get('git_seed_version') != 1:
         raise ValueError('History-free comparison archives cannot be restored as verified Git checkouts')
     if expected_target and metadata.get('target') != expected_target:
         raise ValueError('Source archive target does not match the requested version')
     gcc_sha = metadata['gcc_sha']
-    gcc = gcc_store.read_metadata(f'gcc-{gcc_sha}-v1.json') if gcc_sha else None
+    gcc_index = metadata.get('gcc_index', f'gcc-{gcc_sha}-v1.json')
+    gcc = gcc_store.read_metadata(gcc_index) if gcc_sha else None
     if gcc_sha and (gcc is None or gcc.get('gcc_sha') != gcc_sha):
         print('GCC archive missing; source synchronization is required')
         return None
@@ -371,10 +409,16 @@ def restore_snapshot(store, gcc_store, marker, root, locked_path, expected_diges
         assemble_parts(store, metadata['parts'], archive)
         extract_archive(archive, staging)
         archive.unlink()
+        if metadata.get('git_metadata') is False:
+            restore_seed_bundle(staging)
         if gcc_sha:
             assemble_parts(gcc_store, gcc['parts'], archive)
             extract_archive(archive, staging / 'gcc')
             archive.unlink()
+            if gcc.get('git_metadata') is False:
+                if gcc.get('git_seed_version') != 1:
+                    raise ValueError('GCC archive lacks required current-commit metadata')
+                restore_seed_bundle(staging / 'gcc')
         verify_checkout(metadata['locked'], staging, gcc_sha)
         if root.is_symlink():
             raise ValueError('Refusing to replace a symlink checkout')
@@ -411,6 +455,8 @@ def main():
     parser.add_argument('--digest', default='')
     parser.add_argument('--gcc-sha', default='')
     parser.add_argument('--release-tag', default='')
+    parser.add_argument('--include-history', action='store_true',
+                        help='Opt in to full Git metadata instead of lightweight source snapshots')
     parser.add_argument('--metadata-only', action='store_true',
                         help='Updater: skip downloads when the complete archive already exists')
     args = parser.parse_args()
@@ -434,12 +480,18 @@ def main():
             return
         if not re.fullmatch(r'[a-f0-9]{40}', args.gcc_sha):
             raise ValueError('Invalid GCC commit')
-        metadata = gcc_store.read_metadata(f'gcc-{args.gcc_sha}-v1.json')
+        metadata = gcc_store.read_metadata(variant_index(f'gcc-{args.gcc_sha}-v1.json', args.include_history))
+        if metadata is None and not args.include_history:
+            metadata = gcc_store.read_metadata(f'gcc-{args.gcc_sha}-v1.json')
         if metadata is not None and metadata.get('gcc_sha') == args.gcc_sha:
             with tempfile.TemporaryDirectory(prefix='gcc-download-') as directory:
                 archive = Path(directory) / 'gcc.tar.zst'
                 assemble_parts(gcc_store, metadata['parts'], archive)
                 extract_archive(archive, args.root / 'gcc')
+                if metadata.get('git_metadata') is False:
+                    if metadata.get('git_seed_version') != 1:
+                        raise ValueError('GCC archive lacks required current-commit metadata')
+                    restore_seed_bundle(args.root / 'gcc')
             print('Restored shared GCC toolchain from Release')
         return
     marker = index_name(target, args.epoch, args.digest)
@@ -447,9 +499,22 @@ def main():
         compare_without_history(store, gcc_store, marker, args.root)
         return
     if args.command == 'restore':
-        metadata = restore_snapshot(store, gcc_store, marker, args.root, args.locked,
+        selected_marker = variant_index(marker, args.include_history)
+        metadata = restore_snapshot(store, gcc_store, selected_marker, args.root, args.locked,
                                     args.digest if args.patch == 'lts' else '',
                                     args.metadata_only, target)
+        if metadata is None and not args.include_history:
+            legacy = store.read_metadata(marker)
+            gcc = gcc_store.read_metadata(legacy.get('gcc_index', f'gcc-{legacy["gcc_sha"]}-v1.json')) \
+                if legacy and legacy['gcc_sha'] else None
+            # Convert a complete legacy snapshot once, avoiding a Google source
+            # sync. A dangling old index is not a valid migration source.
+            complete = legacy and store.has_parts(legacy['parts']) and \
+                (not legacy['gcc_sha'] or (gcc and gcc_store.has_parts(gcc['parts'])))
+            if complete:
+                legacy = restore_snapshot(store, gcc_store, marker, args.root, args.locked,
+                    args.digest if args.patch == 'lts' else '', expected_target=target)
+                metadata = publish_snapshot(store, gcc_store, args.root, marker, legacy)
         write_outputs(hit='true' if metadata else 'false',
                       digest=metadata['digest'] if metadata else '',
                       gcc_sha=metadata['gcc_sha'] if metadata else '')
@@ -463,11 +528,8 @@ def main():
     makefile = (args.root / 'common' / 'Makefile').read_text(encoding='utf-8')
     actual_sublevel = re.search(r'^SUBLEVEL\s*=\s*(\d+)', makefile, re.M).group(1)
     metadata['kernel'] = f'{args.kernel}.{actual_sublevel}'
-    if args.gcc_sha:
-        publish_archive(gcc_store, args.root / 'gcc', f'gcc-{args.gcc_sha}-v1.json',
-                        {'schema': 1, 'gcc_sha': args.gcc_sha})
-    publish_archive(store, args.root, marker, metadata, exclude_gcc=True)
-    print(f'Pristine source archive is available in Release {tag}: {marker}')
+    publish_snapshot(store, gcc_store, args.root, marker, metadata, args.include_history)
+    print(f'Pristine source archive is available in Release {tag}: {variant_index(marker, args.include_history)}')
 
 
 if __name__ == '__main__':

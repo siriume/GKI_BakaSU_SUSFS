@@ -32,8 +32,8 @@ on:
         description: '源码归档版本，须与内核构建使用的版本一致'
         type: string
         default: v1
-      compare_without_history:
-        description: '额外生成不含 Git 历史的源码/GCC 归档，并在 Summary 对比大小'
+      include_history:
+        description: '保留 Git 历史/完整元数据（默认不勾选，使用无历史小包）'
         type: boolean
         default: false
 
@@ -114,4 +114,4 @@ jobs:
           revision: ${{ matrix.revision }}
           cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
           update_only: 'true'
-          compare_without_history: ${{ inputs.compare_without_history && 'true' || 'false' }}
+          include_history: ${{ inputs.include_history && 'true' || 'false' }}

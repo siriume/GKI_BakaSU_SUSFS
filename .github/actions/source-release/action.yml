@@ -22,9 +22,9 @@ inputs:
   update_only:
     default: 'false'
     description: Skip downloading complete archives when only updating Releases
-  compare_without_history:
+  include_history:
     default: 'false'
-    description: Publish separate history-free archives and report compressed size savings
+    description: Opt in to full Git metadata; unchecked uses history-free source archives
 outputs:
   digest:
     description: SHA256 of the full locked source manifest and GCC revision
@@ -45,22 +45,6 @@ runs:
         SOURCE_PATCH: ${{ inputs.os_patch_level }}
         SOURCE_REVISION: ${{ inputs.revision }}
         SOURCE_EPOCH: ${{ inputs.cache_epoch }}
-        SOURCE_UPDATE_ONLY: ${{ inputs.update_only == 'true' && inputs.compare_without_history != 'true' && 'true' || 'false' }}
+        SOURCE_UPDATE_ONLY: ${{ inputs.update_only }}
+        SOURCE_INCLUDE_HISTORY: ${{ inputs.include_history }}
       run: bash "$GITHUB_WORKSPACE/scripts/source_release.sh"
-    - name: 生成无 Git 历史归档并对比大小
-      if: inputs.compare_without_history == 'true'
-      shell: bash
-      env:
-        SOURCE_ANDROID: ${{ inputs.android_version }}
-        SOURCE_KERNEL: ${{ inputs.kernel_version }}
-        SOURCE_SUBLEVEL: ${{ inputs.sub_level }}
-        SOURCE_PATCH: ${{ inputs.os_patch_level }}
-        SOURCE_REVISION: ${{ inputs.revision }}
-        SOURCE_EPOCH: ${{ inputs.cache_epoch }}
-        SOURCE_DIGEST: ${{ steps.snapshot.outputs.digest }}
-      run: |
-        python3 "$GITHUB_WORKSPACE/scripts/source_release.py" compare \
-          --android "$SOURCE_ANDROID" --kernel "$SOURCE_KERNEL" --sublevel "$SOURCE_SUBLEVEL" \
-          --patch "$SOURCE_PATCH" --revision "$SOURCE_REVISION" --epoch "$SOURCE_EPOCH" \
-          --root "$GITHUB_WORKSPACE/$SOURCE_ANDROID-$SOURCE_KERNEL-$SOURCE_SUBLEVEL" \
-          --locked "$RUNNER_TEMP/source-locked.xml" --digest "$SOURCE_DIGEST"

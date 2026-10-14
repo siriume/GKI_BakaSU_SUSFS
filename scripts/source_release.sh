@@ -8,6 +8,9 @@ helper=(python3 "$GITHUB_WORKSPACE/scripts/source_release.py")
 args=(--android "$SOURCE_ANDROID" --kernel "$SOURCE_KERNEL" --sublevel "$SOURCE_SUBLEVEL"
       --patch "$SOURCE_PATCH" --revision "$SOURCE_REVISION" --epoch "$SOURCE_EPOCH"
       --root "$root" --locked "$locked")
+if [ "${SOURCE_INCLUDE_HISTORY:-false}" = true ]; then
+  args+=(--include-history)
+fi
 
 retry() {
   local attempt=1
