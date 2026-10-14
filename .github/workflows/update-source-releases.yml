@@ -10,10 +10,11 @@ on:
   workflow_dispatch:
     inputs:
       source_group:
-        description: '源码分组，例如 android13-5.15；all 表示全部 JSON 已配置版本'
+        description: '默认更新 android12-5.10 和 android13-5.15；all 表示全部 JSON 已配置版本'
         type: choice
-        default: all
+        default: android12-5.10,android13-5.15
         options:
+          - android12-5.10,android13-5.15
           - all
           - android12-5.10
           - android13-5.10
@@ -55,7 +56,7 @@ jobs:
       - name: 读取现有版本配置
         id: matrix
         env:
-          SOURCE_GROUP: ${{ inputs.source_group || 'all' }}
+          SOURCE_GROUP: ${{ inputs.source_group || 'android12-5.10,android13-5.15' }}
           SOURCE_TARGETS: ${{ inputs.targets || 'configured' }}
         run: |
           python3 - <<'PY'
@@ -63,10 +64,11 @@ jobs:
           from pathlib import Path
           sys.path.insert(0, 'scripts')
           from prepare_matrix import build_matrix, validate_data
+          selected_groups = {group.strip() for group in os.environ['SOURCE_GROUP'].split(',')}
           matrix = []
           for path in sorted(Path('data').glob('android*/*.json')):
               group = f'{path.parent.name}-{path.stem}'
-              if os.environ['SOURCE_GROUP'] not in ('all', group):
+              if 'all' not in selected_groups and group not in selected_groups:
                   continue
               data = json.loads(path.read_text())
               validate_data(data, str(path), path.parent.name, path.stem)
@@ -82,7 +84,7 @@ jobs:
           PY
 
   archive:
-    name: 源码 ${{ matrix.android_version }}-${{ matrix.kernel_version }}.${{ matrix.sub_level }}-${{ matrix.os_patch_level }}-${{ matrix.revision }}
+    name: 源码 ${{ matrix.android_version }}-${{ matrix.kernel_version }}.${{ matrix.sub_level }}-${{ matrix.os_patch_level }}${{ matrix.revision && format('-{0}', matrix.revision) || '' }}
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 90

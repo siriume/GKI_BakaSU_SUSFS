@@ -1,432 +1,1 @@
-import hashlib
-import io
-import json
-import os
-from pathlib import Path
-import sys
-import shutil
-import subprocess
-import tempfile
-import unittest
-from unittest.mock import patch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-import source_release
-
-
-class MemoryStore:
-    def __init__(self):
-        self.assets = {}
-        self.uploads = []
-
-    def read_metadata(self, name):
-        value = self.assets.get(name)
-        return json.loads(value) if value else None
-
-    def download(self, name, destination):
-        destination.write_bytes(self.assets[name])
-
-    def upload(self, path):
-        if path.name in self.assets:
-            raise RuntimeError('Asset already exists')
-        self.uploads.append(path.name)
-        self.assets[path.name] = path.read_bytes()
-
-    def delete_asset(self, name):
-        self.assets.pop(name, None)
-
-
-class SourceReleaseTests(unittest.TestCase):
-    def test_default_variant_is_lightweight_and_part_limit_is_199_gib(self):
-        self.assertEqual(source_release.variant_index('fixed-v1.json'), 'fixed-v1-no-history-v2.json')
-        self.assertEqual(source_release.variant_index('fixed-v1.json', True), 'fixed-v1.json')
-        self.assertEqual(source_release.PART_LIMIT, 2136746229)
-        self.assertLess(source_release.PART_LIMIT, 2 * 1024**3)
-
-    def test_fixed_and_lts_names_do_not_collide(self):
-        self.assertEqual(source_release.target_name('android13', '5.15', '123', '2023-11', 'r9'),
-                         'android13-5.15.123-2023-11-r9')
-        # LTS lookup must not depend on a potentially stale JSON sublevel.
-        self.assertEqual(source_release.target_name('android13', '5.15', '220', 'lts', ''),
-                         'android13-5.15-lts')
-        with self.assertRaises(ValueError):
-            source_release.target_name('../oops', '5.15', '123', '2023-11', 'r9')
-
-    def test_fixed_reuses_index_but_lts_is_keyed_by_all_commits(self):
-        fixed = source_release.index_name('android13-5.15.123-2023-11-r9', 'v1', '')
-        first = source_release.index_name('android13-5.15-lts', 'v1', 'a' * 64)
-        second = source_release.index_name('android13-5.15-lts', 'v1', 'b' * 64)
-        self.assertNotEqual(first, second)
-        self.assertNotEqual(fixed, source_release.index_name('android13-5.15.123-2023-11-r9', 'v2', ''))
-        with self.assertRaises(ValueError):
-            source_release.index_name('android13-5.15-lts', 'v1', '')
-
-    def test_split_reassemble_and_detect_corruption_before_extract(self):
-        store = MemoryStore()
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            parts = source_release.split_stream(io.BytesIO(b'1234567890'), root, 'source', limit=4)
-            self.assertEqual([p['size'] for p in parts], [4, 4, 2])
-            for part in parts:
-                store.upload(root / part['name'])
-            output = root / 'joined'
-            source_release.assemble_parts(store, parts, output)
-            self.assertEqual(output.read_bytes(), b'1234567890')
-            store.assets[parts[0]['name']] = b'xxxx'
-            with self.assertRaisesRegex(ValueError, 'checksum'):
-                source_release.assemble_parts(store, parts, output)
-
-    def test_single_file_has_no_part_suffix_including_exact_limit(self):
-        with tempfile.TemporaryDirectory() as temp:
-            work = Path(temp)
-            for data in (b'123', b'1234'):
-                parts = source_release.split_stream(io.BytesIO(data), work, 'single', limit=4)
-                self.assertEqual([p['name'] for p in parts], ['single.tar.zst'])
-                self.assertEqual((work / 'single.tar.zst').read_bytes(), data)
-
-    def test_reject_download_paths_outside_archive_directory(self):
-        with tempfile.TemporaryDirectory() as temp:
-            with self.assertRaises(ValueError):
-                source_release.assemble_parts(MemoryStore(), [
-                    {'name': '../escape', 'size': 0, 'sha256': hashlib.sha256(b'').hexdigest()}
-                ], Path(temp) / 'joined')
-
-    def test_missing_release_is_a_miss_without_touching_checkout(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp) / 'checkout'
-            root.mkdir()
-            marker = root / 'keep'
-            marker.write_text('untouched')
-            result = source_release.restore_snapshot(MemoryStore(), MemoryStore(), 'missing.json',
-                                                     root, Path(temp) / 'locked.xml')
-            self.assertIsNone(result)
-            self.assertEqual(marker.read_text(), 'untouched')
-
-    def test_metadata_identity_rejects_changed_manifest(self):
-        metadata = {'schema': 1, 'locked': '<manifest/>', 'gcc_sha': '',
-                    'digest': source_release.manifest_digest('<manifest/>', '')}
-        source_release.validate_identity(metadata)
-        metadata['locked'] = '<manifest><project/></manifest>'
-        with self.assertRaisesRegex(ValueError, 'identity'):
-            source_release.validate_identity(metadata)
-
-    def test_updater_skips_download_for_existing_complete_snapshot(self):
-        store = MemoryStore()
-        metadata = {'schema': 1, 'locked': '<manifest/>', 'gcc_sha': '',
-                    'digest': source_release.manifest_digest('<manifest/>', ''),
-                    'target': 'fixed', 'parts': []}
-        store.assets['fixed.json'] = json.dumps(metadata).encode()
-        with patch.object(store, 'download', side_effect=AssertionError('Must not download')):
-            restored = source_release.restore_snapshot(store, MemoryStore(), 'fixed.json',
-                Path('unused'), Path('unused.xml'), metadata_only=True, expected_target='fixed')
-        self.assertEqual(restored['digest'], metadata['digest'])
-        with self.assertRaisesRegex(ValueError, 'target'):
-            source_release.restore_snapshot(store, MemoryStore(), 'fixed.json',
-                Path('unused'), Path('unused.xml'), metadata_only=True, expected_target='other')
-
-    def test_publish_uploads_completion_marker_last_and_reuses_existing(self):
-        store = MemoryStore()
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            def pack(tree, work, prefix, exclude_gcc=False):
-                return source_release.split_stream(io.BytesIO(b'pristine'), work, prefix, limit=4)
-            with patch.object(source_release, 'archive_tree', side_effect=pack):
-                source_release.publish_archive(store, root, 'fixed-v1.json', {'schema': 1})
-                self.assertEqual(store.uploads[-1], 'fixed-v1.json')
-                count = len(store.uploads)
-                source_release.publish_archive(store, root, 'fixed-v1.json', {'schema': 1})
-                self.assertEqual(len(store.uploads), count)
-
-    def test_failed_part_upload_never_publishes_completion_marker(self):
-        store = MemoryStore()
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            def pack(tree, work, prefix, exclude_gcc=False):
-                return source_release.split_stream(io.BytesIO(b'pristine'), work, prefix, limit=4)
-            with patch.object(source_release, 'archive_tree', side_effect=pack), \
-                 patch.object(store, 'upload', side_effect=RuntimeError('network failed')):
-                with self.assertRaises(RuntimeError):
-                    source_release.publish_archive(store, root, 'fixed-v1.json', {'schema': 1})
-            self.assertNotIn('fixed-v1.json', store.assets)
-
-    def test_losing_publisher_removes_only_its_own_payloads(self):
-        store = MemoryStore()
-        winner = {'schema': 1, 'parts': [{'name': 'winner.tar.zst'}]}
-        store.assets['winner.tar.zst'] = b'other publisher'
-        original_upload = store.upload
-        def racing_upload(path):
-            if path.name == 'fixed-v1.json':
-                # The other publisher wins between our final read and upload.
-                store.assets[path.name] = json.dumps(winner).encode()
-                raise RuntimeError('Asset already exists')
-            original_upload(path)
-        with tempfile.TemporaryDirectory() as temp:
-            def pack(tree, work, prefix, exclude_gcc=False):
-                return source_release.split_stream(io.BytesIO(b'ours'), work, prefix, limit=3)
-            with patch.object(source_release, 'archive_tree', side_effect=pack), \
-                 patch.object(store, 'upload', side_effect=racing_upload):
-                result = source_release.publish_archive(store, Path(temp), 'fixed-v1.json', {'schema': 1})
-        self.assertEqual(result, winner)
-        self.assertEqual(set(store.assets), {'winner.tar.zst', 'fixed-v1.json'})
-
-    def test_losing_publisher_cleans_up_when_index_arrives_during_payload_upload(self):
-        store = MemoryStore()
-        winner = {'schema': 1, 'parts': [{'name': 'winner.tar.zst'}]}
-        store.assets['winner.tar.zst'] = b'other publisher'
-        original_upload = store.upload
-        def racing_upload(path):
-            original_upload(path)
-            store.assets['fixed-v1.json'] = json.dumps(winner).encode()
-        with tempfile.TemporaryDirectory() as temp:
-            def pack(tree, work, prefix, exclude_gcc=False):
-                return source_release.split_stream(io.BytesIO(b'ours'), work, prefix)
-            with patch.object(source_release, 'archive_tree', side_effect=pack), \
-                 patch.object(store, 'upload', side_effect=racing_upload):
-                result = source_release.publish_archive(store, Path(temp), 'fixed-v1.json', {'schema': 1})
-        self.assertEqual(result, winner)
-        self.assertEqual(set(store.assets), {'winner.tar.zst', 'fixed-v1.json'})
-
-    def test_lost_index_upload_response_preserves_referenced_payload(self):
-        store = MemoryStore()
-        original_upload = store.upload
-        def upload_with_lost_response(path):
-            original_upload(path)
-            if path.name == 'fixed-v1.json':
-                raise RuntimeError('Response lost after server accepted index')
-        with tempfile.TemporaryDirectory() as temp:
-            def pack(tree, work, prefix, exclude_gcc=False):
-                return source_release.split_stream(io.BytesIO(b'ours'), work, prefix)
-            with patch.object(source_release, 'archive_tree', side_effect=pack), \
-                 patch.object(store, 'upload', side_effect=upload_with_lost_response):
-                result = source_release.publish_archive(store, Path(temp), 'fixed-v1.json', {'schema': 1})
-        self.assertEqual(store.assets[result['parts'][0]['name']], b'ours')
-        self.assertEqual(json.loads(store.assets['fixed-v1.json']), result)
-
-    def test_publisher_skips_upload_if_another_job_finishes_during_compression(self):
-        store = MemoryStore()
-        winner = {'schema': 1, 'parts': [{'name': 'winner.tar.zst'}]}
-        with tempfile.TemporaryDirectory() as temp:
-            def pack(tree, work, prefix, exclude_gcc=False):
-                parts = source_release.split_stream(io.BytesIO(b'ours'), work, prefix)
-                store.assets['fixed-v1.json'] = json.dumps(winner).encode()
-                return parts
-            with patch.object(source_release, 'archive_tree', side_effect=pack):
-                result = source_release.publish_archive(store, Path(temp), 'fixed-v1.json', {'schema': 1})
-        self.assertEqual(result, winner)
-        self.assertEqual(store.uploads, [])
-
-    def test_release_upload_does_not_allow_overwriting_existing_index(self):
-        store = source_release.ReleaseStore('owner/repo', 'source-toolchains')
-        with patch.object(store, 'ensure_release'), patch.object(store, 'gh') as gh:
-            store.upload(Path('gcc-v1.json'))
-        self.assertNotIn('--clobber', gh.call_args.args)
-
-    def test_history_free_comparison_includes_source_and_shared_gcc_sizes(self):
-        store, gcc_store = MemoryStore(), MemoryStore()
-        gcc_sha = 'a' * 40
-        original = {'schema': 1, 'target': 'fixed', 'locked': '<manifest/>',
-                    'gcc_sha': gcc_sha, 'digest': source_release.manifest_digest('<manifest/>', gcc_sha),
-                    'parts': [{'name': 'source.tar.zst', 'size': 100}]}
-        store.assets['fixed-v1.json'] = json.dumps(original).encode()
-        gcc_store.assets[f'gcc-{gcc_sha}-v1.json'] = json.dumps({
-            'schema': 1, 'gcc_sha': gcc_sha, 'parts': [{'name': 'gcc.tar.zst', 'size': 80}]
-        }).encode()
-        with tempfile.TemporaryDirectory() as temp:
-            def pack(tree, work, prefix, exclude_gcc=False, exclude_history=False):
-                self.assertTrue(exclude_history)
-                return source_release.split_stream(io.BytesIO(b'lightweight'), work, prefix)
-            with patch.object(source_release, 'archive_tree', side_effect=pack), \
-                 patch.object(source_release, 'verify_checkout'), \
-                 patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': str(Path(temp) / 'summary')}):
-                sizes = source_release.compare_without_history(store, gcc_store, 'fixed-v1.json', Path(temp))
-                self.assertIn('减少 87.78%', (Path(temp) / 'summary').read_text(encoding='utf-8'))
-        self.assertEqual(sizes['original_bytes'], 180)
-        self.assertEqual(sizes['without_history_bytes'], 22)
-        self.assertIn('fixed-v1-no-history.json', store.assets)
-        self.assertIn(f'gcc-{gcc_sha}-v1-no-history.json', gcc_store.assets)
-        self.assertFalse(json.loads(store.assets['fixed-v1-no-history.json'])['git_metadata'])
-        self.assertEqual(json.loads(store.assets['fixed-v1.json']), original)
-
-    def test_comparison_archive_is_not_restored_as_a_verified_git_checkout(self):
-        store = MemoryStore()
-        metadata = {'schema': 1, 'locked': '<manifest/>', 'gcc_sha': '', 'git_metadata': False,
-                    'digest': source_release.manifest_digest('<manifest/>', '')}
-        store.assets['no-history.json'] = json.dumps(metadata).encode()
-        with self.assertRaisesRegex(ValueError, 'History-free comparison'):
-            source_release.restore_snapshot(store, MemoryStore(), 'no-history.json',
-                                            Path('unused'), Path('unused.xml'))
-
-    @unittest.skipUnless(os.name == 'posix' and shutil.which('zstd'), 'Requires Linux tar and zstd')
-    def test_history_free_archive_keeps_working_files_and_excludes_git_metadata(self):
-        with tempfile.TemporaryDirectory() as temp:
-            work = Path(temp)
-            root, output = work / 'source', work / 'packed'
-            output.mkdir()
-            for relative in ('.repo/objects/pack', 'common/.git/objects/pack',
-                             'vendor/nested/.git', 'common/.gitignore', 'common/source.c',
-                             'gcc/compiler'):
-                path = root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(relative)
-            script = root / 'common' / 'run'
-            script.write_text('#!/bin/sh\nexit 0\n')
-            script.chmod(0o755)
-            (root / 'common' / 'link').symlink_to('source.c')
-            parts = source_release.archive_tree(root, output, 'light', exclude_gcc=True,
-                                                exclude_history=True)
-            self.assertEqual(len(parts), 1)
-            restored = work / 'restored'
-            source_release.extract_archive(output / parts[0]['name'], restored)
-            self.assertFalse((restored / '.repo').exists())
-            self.assertFalse((restored / 'common' / '.git').exists())
-            self.assertFalse((restored / 'vendor' / 'nested' / '.git').exists())
-            self.assertFalse((restored / 'gcc').exists())
-            self.assertTrue((restored / 'common' / '.gitignore').exists())
-            self.assertTrue((restored / 'common' / 'source.c').exists())
-            self.assertTrue((restored / 'common' / 'link').is_symlink())
-            self.assertTrue((restored / 'common' / 'run').stat().st_mode & 0o111)
-
-    @unittest.skipUnless(os.name == 'posix' and shutil.which('zstd'), 'Requires Linux tar and zstd')
-    def test_real_archive_roundtrip_preserves_git_symlinks_and_executable_mode(self):
-        store, gcc_store = MemoryStore(), MemoryStore()
-        with tempfile.TemporaryDirectory() as temp:
-            work = Path(temp)
-            root = work / 'original'
-            for name in ('common', 'gcc'):
-                directory = root / name
-                directory.mkdir(parents=True)
-                (directory / 'payload').write_text(name)
-                if name == 'common':
-                    (directory / 'Makefile').write_text('SUBLEVEL = 123\n')
-                subprocess.run(['git', 'init', '-q', str(directory)], check=True)
-                subprocess.run(['git', '-C', str(directory), 'add', '.'], check=True)
-                subprocess.run(['git', '-C', str(directory), '-c', 'user.name=Test',
-                    '-c', 'user.email=test@example.com', 'commit', '-qm', 'fixture'], check=True)
-            script = root / 'common' / 'run'
-            script.write_text('#!/bin/sh\nexit 0\n')
-            script.chmod(0o755)
-            (root / 'common' / 'link').symlink_to('payload')
-            # Model repo's relative .git/object links, not only standalone clones.
-            git_dir = root / '.repo' / 'projects' / 'common.git'
-            git_dir.parent.mkdir(parents=True)
-            (root / 'common' / '.git').rename(git_dir)
-            (root / 'common' / '.git').symlink_to('../.repo/projects/common.git', target_is_directory=True)
-            object_dir = root / '.repo' / 'project-objects' / 'kernel' / 'common.git' / 'objects'
-            object_dir.parent.mkdir(parents=True)
-            (git_dir / 'objects').rename(object_dir)
-            (git_dir / 'objects').symlink_to('../../project-objects/kernel/common.git/objects', target_is_directory=True)
-            subprocess.run(['git', '--git-dir', str(git_dir), 'config', 'core.worktree',
-                            '../../../common'], check=True)
-            def head(path):
-                return subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD'], text=True).strip()
-            gcc_sha = head(root / 'gcc')
-            locked = '<manifest><project name="kernel/common" path="common" revision="' + head(root / 'common') + '"/></manifest>'
-            metadata = {'schema': 1, 'target': 'fixed', 'locked': locked, 'gcc_sha': gcc_sha,
-                        'digest': source_release.manifest_digest(locked, gcc_sha)}
-            source_release.publish_archive(gcc_store, root / 'gcc', f'gcc-{gcc_sha}-v1.json',
-                                           {'schema': 1, 'gcc_sha': gcc_sha})
-            source_release.publish_archive(store, root, 'fixed.json', metadata, exclude_gcc=True)
-            restored = work / 'restored'
-            source_release.restore_snapshot(store, gcc_store, 'fixed.json', restored,
-                                           work / 'locked.xml', metadata['digest'])
-            self.assertTrue((restored / 'common' / 'link').is_symlink())
-            self.assertTrue((restored / 'common' / '.git').is_symlink())
-            self.assertTrue((restored / 'common' / 'run').stat().st_mode & 0o111)
-            self.assertEqual((restored / 'gcc' / 'payload').read_text(), 'gcc')
-            self.assertEqual(head(restored / 'common'), head(root / 'common'))
-            self.assertEqual((work / 'locked.xml').read_text(), locked)
-
-            # Exercise the actual CLI and Bash fixed-version fast path with a
-            # filesystem-backed gh fixture. No Google/repo request is needed.
-            target = 'android13-5.15.123-2023-11-r9'
-            index = json.loads(store.assets['fixed.json'])
-            index['target'] = target
-            store.assets[target + '-v1.json'] = json.dumps(index).encode()
-            releases = work / 'releases'
-            for tag, memory in [('source-android13-5.15', store), ('source-toolchains', gcc_store)]:
-                folder = releases / tag
-                folder.mkdir(parents=True)
-                for name, data in memory.assets.items():
-                    (folder / name).write_bytes(data)
-            bin_dir = work / 'bin'
-            bin_dir.mkdir()
-            gh = bin_dir / 'gh'
-            gh.write_text('#!' + sys.executable + '\n' + '''
-import json, os, shutil, sys
-from pathlib import Path
-a = sys.argv[1:]
-releases = Path(os.environ['FAKE_RELEASES'])
-if a[0] == 'api':
-    if '/releases/tags/' in a[1]:
-        print(json.dumps({'id': a[1].rsplit('/', 1)[1]}))
-    else:
-        tag = a[1].split('/releases/')[1].split('/')[0]
-        print(json.dumps([[{'name': p.name, 'size': p.stat().st_size} for p in (releases / tag).iterdir()]]))
-elif a[:2] == ['release', 'download']:
-    name = a[a.index('--pattern') + 1]
-    if os.environ.get('NO_PAYLOAD_DOWNLOAD') and not name.endswith('.json'):
-        raise SystemExit('Updater downloaded an existing payload')
-    destination = Path(a[a.index('--dir') + 1]) / name
-    shutil.copyfile(releases / a[2] / name, destination)
-elif a[:2] == ['release', 'upload']:
-    source = Path(a[3])
-    destination = releases / a[2] / source.name
-    if destination.exists():
-        raise SystemExit('Asset already exists')
-    shutil.copyfile(source, destination)
-else:
-    raise SystemExit('Unexpected GitHub operation: ' + repr(a))
-''')
-            gh.chmod(0o755)
-            workspace = work / 'workspace'
-            workspace.mkdir()
-            scripts = Path(__file__).resolve().parents[1] / 'scripts'
-            (workspace / 'scripts').symlink_to(scripts, target_is_directory=True)
-            runner_temp = work / 'runner'
-            runner_temp.mkdir()
-            environment = {**os.environ, 'PATH': str(bin_dir) + os.pathsep + os.environ['PATH'],
-                'FAKE_RELEASES': str(releases), 'GITHUB_WORKSPACE': str(workspace),
-                'GITHUB_REPOSITORY': 'owner/repo', 'RUNNER_TEMP': str(runner_temp),
-                'GITHUB_OUTPUT': str(work / 'outputs'), 'GITHUB_STEP_SUMMARY': str(work / 'summary'),
-                'SOURCE_ANDROID': 'android13', 'SOURCE_KERNEL': '5.15', 'SOURCE_SUBLEVEL': '123',
-                'SOURCE_PATCH': '2023-11', 'SOURCE_REVISION': 'r9', 'SOURCE_EPOCH': 'v1',
-                'SOURCE_UPDATE_ONLY': 'false'}
-            result = subprocess.run(['bash', str(scripts / 'source_release.sh')],
-                env=environment, text=True, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn('hit=true', (work / 'outputs').read_text())
-            self.assertIn('digest=' + metadata['digest'], (work / 'outputs').read_text())
-            self.assertTrue((workspace / 'android13-5.15-123' / 'common' / 'link').is_symlink())
-            # The first run converts the complete old Release into the new
-            # default format; the next run restores that lightweight archive.
-            lightweight_index = releases / 'source-android13-5.15' / (target + '-v1-no-history-v2.json')
-            self.assertTrue(lightweight_index.exists())
-            self.assertEqual(json.loads(lightweight_index.read_text())['git_seed_version'], 1)
-            shutil.rmtree(workspace / 'android13-5.15-123')
-            result = subprocess.run(['bash', str(scripts / 'source_release.sh')],
-                env=environment, text=True, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertFalse((workspace / 'android13-5.15-123' / '.repo').exists())
-            self.assertTrue((workspace / 'android13-5.15-123' / 'common' / '.git').is_dir())
-            self.assertFalse((workspace / 'android13-5.15-123' / 'common' / '.git').is_symlink())
-            self.assertEqual(head(workspace / 'android13-5.15-123' / 'common'), head(root / 'common'))
-            environment.update(SOURCE_UPDATE_ONLY='true', NO_PAYLOAD_DOWNLOAD='true')
-            result = subprocess.run(['bash', str(scripts / 'source_release.sh')],
-                env=environment, text=True, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn('skipping download', result.stdout)
-            # The checkbox opts back into the full-metadata index.
-            full_workspace = work / 'full-workspace'
-            full_workspace.mkdir()
-            (full_workspace / 'scripts').symlink_to(scripts, target_is_directory=True)
-            environment.update(GITHUB_WORKSPACE=str(full_workspace), SOURCE_UPDATE_ONLY='false',
-                               SOURCE_INCLUDE_HISTORY='true')
-            environment.pop('NO_PAYLOAD_DOWNLOAD')
-            result = subprocess.run(['bash', str(scripts / 'source_release.sh')],
-                env=environment, text=True, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertTrue((full_workspace / 'android13-5.15-123' / '.repo').is_dir())
-
-
-if __name__ == '__main__':
-    unittest.main()
+import hashlibimport ioimport jsonimport osfrom pathlib import Pathimport sysimport shutilimport subprocessimport tempfileimport unittestfrom unittest.mock import patchsys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))import source_releaseclass MemoryStore:    def __init__(self):        self.assets = {}        self.uploads = []    def read_metadata(self, name):        value = self.assets.get(name)        return json.loads(value) if value else None    def download(self, name, destination):        destination.write_bytes(self.assets[name])    def upload(self, path):        if path.name in self.assets:            raise RuntimeError('Asset already exists')        self.uploads.append(path.name)        self.assets[path.name] = path.read_bytes()    def delete_asset(self, name):        self.assets.pop(name, None)class SourceReleaseTests(unittest.TestCase):    def test_default_variant_is_lightweight_and_part_limit_is_below_2_gib(self):        self.assertEqual(source_release.variant_index('fixed-v1.json'), 'fixed-v1.json')        self.assertEqual(source_release.variant_index('fixed-v1.json', True), 'fixed-v1-with-history.json')        self.assertEqual(source_release.PART_LIMIT, 2147483647)        self.assertLess(source_release.PART_LIMIT, 2 * 1024**3)    def test_fixed_and_lts_names_do_not_collide(self):        self.assertEqual(source_release.target_name('android13', '5.15', '123', '2023-11', 'r9'),                         'android13-5.15.123-2023-11-r9')        # LTS lookup must not depend on a potentially stale JSON sublevel.        self.assertEqual(source_release.target_name('android13', '5.15', '220', 'lts', ''),                         'android13-5.15-lts')        with self.assertRaises(ValueError):            source_release.target_name('../oops', '5.15', '123', '2023-11', 'r9')    def test_fixed_reuses_index_but_lts_is_keyed_by_all_commits(self):        fixed = source_release.index_name('android13-5.15.123-2023-11-r9', 'v1', '')        first = source_release.index_name('android13-5.15-lts', 'v1', 'a' * 64)        second = source_release.index_name('android13-5.15-lts', 'v1', 'b' * 64)        self.assertNotEqual(first, second)        self.assertNotEqual(fixed, source_release.index_name('android13-5.15.123-2023-11-r9', 'v2', ''))        with self.assertRaises(ValueError):            source_release.index_name('android13-5.15-lts', 'v1', '')    def test_split_reassemble_and_detect_corruption_before_extract(self):        store = MemoryStore()        with tempfile.TemporaryDirectory() as temp:            root = Path(temp)            parts = source_release.split_stream(io.BytesIO(b'1234567890'), root, 'source', limit=4)            self.assertEqual([p['size'] for p in parts], [4, 4, 2])            for part in parts:                store.upload(root / part['name'])            output = root / 'joined'            source_release.assemble_parts(store, parts, output)            self.assertEqual(output.read_bytes(), b'1234567890')            store.assets[parts[0]['name']] = b'xxxx'            with self.assertRaisesRegex(ValueError, 'checksum'):                source_release.assemble_parts(store, parts, output)    def test_single_file_has_no_part_suffix_including_exact_limit(self):        with tempfile.TemporaryDirectory() as temp:            work = Path(temp)            for data in (b'123', b'1234'):                parts = source_release.split_stream(io.BytesIO(data), work, 'single', limit=4)                self.assertEqual([p['name'] for p in parts], ['single.tar.zst'])                self.assertEqual((work / 'single.tar.zst').read_bytes(), data)    def test_reject_download_paths_outside_archive_directory(self):        with tempfile.TemporaryDirectory() as temp:            with self.assertRaises(ValueError):                source_release.assemble_parts(MemoryStore(), [                    {'name': '../escape', 'size': 0, 'sha256': hashlib.sha256(b'').hexdigest()}                ], Path(temp) / 'joined')    def test_missing_release_is_a_miss_without_touching_checkout(self):        with tempfile.TemporaryDirectory() as temp:            root = Path(temp) / 'checkout'            root.mkdir()            marker = root / 'keep'            marker.write_text('untouched')            result = source_release.restore_snapshot(MemoryStore(), MemoryStore(), 'missing.json',                                                     root, Path(temp) / 'locked.xml')            self.assertIsNone(result)            self.assertEqual(marker.read_text(), 'untouched')    def test_metadata_identity_rejects_changed_manifest(self):        metadata = {'schema': 1, 'locked': '<manifest/>', 'gcc_sha': '',                    'digest': source_release.manifest_digest('<manifest/>', '')}        source_release.validate_identity(metadata)        metadata['locked'] = '<manifest><project/></manifest>'        with self.assertRaisesRegex(ValueError, 'identity'):            source_release.validate_identity(metadata)    def test_updater_skips_download_for_existing_complete_snapshot(self):        store = MemoryStore()        metadata = {'schema': 1, 'locked': '<manifest/>', 'gcc_sha': '',                    'digest': source_release.manifest_digest('<manifest/>', ''),                    'target': 'fixed', 'parts': []}        store.assets['fixed.json'] = json.dumps(metadata).encode()        with patch.object(store, 'download', side_effect=AssertionError('Must not download')):            restored = source_release.restore_snapshot(store, MemoryStore(), 'fixed.json',                Path('unused'), Path('unused.xml'), metadata_only=True, expected_target='fixed')        self.assertEqual(restored['digest'], metadata['digest'])        with self.assertRaisesRegex(ValueError, 'target'):            source_release.restore_snapshot(store, MemoryStore(), 'fixed.json',                Path('unused'), Path('unused.xml'), metadata_only=True, expected_target='other')    def test_publish_uploads_completion_marker_last_and_reuses_existing(self):        store = MemoryStore()        with tempfile.TemporaryDirectory() as temp:            root = Path(temp)            def pack(tree, work, prefix, exclude_gcc=False):                return source_release.split_stream(io.BytesIO(b'pristine'), work, prefix, limit=4)            with patch.object(source_release, 'archive_tree', side_effect=pack):                source_release.publish_archive(store, root, 'fixed-v1.json', {'schema': 1})                self.assertEqual(store.uploads[-1], 'fixed-v1.json')                count = len(store.uploads)                source_release.publish_archive(store, root, 'fixed-v1.json', {'schema': 1})                self.assertEqual(len(store.uploads), count)    def test_failed_part_upload_never_publishes_completion_marker(self):        store = MemoryStore()        with tempfile.TemporaryDirectory() as temp:            root = Path(temp)            def pack(tree, work, prefix, exclude_gcc=False):                return source_release.split_stream(io.BytesIO(b'pristine'), work, prefix, limit=4)            with patch.object(source_release, 'archive_tree', side_effect=pack), \                 patch.object(store, 'upload', side_effect=RuntimeError('network failed')):                with self.assertRaises(RuntimeError):                    source_release.publish_archive(store, root, 'fixed-v1.json', {'schema': 1})            self.assertNotIn('fixed-v1.json', store.assets)    def test_losing_publisher_removes_only_its_own_payloads(self):        store = MemoryStore()        winner = {'schema': 1, 'parts': [{'name': 'winner.tar.zst'}]}        store.assets['winner.tar.zst'] = b'other publisher'        original_upload = store.upload        def racing_upload(path):            if path.name == 'fixed-v1.json':                # The other publisher wins between our final read and upload.                store.assets[path.name] = json.dumps(winner).encode()                raise RuntimeError('Asset already exists')            original_upload(path)        with tempfile.TemporaryDirectory() as temp:            def pack(tree, work, prefix, exclude_gcc=False):                return source_release.split_stream(io.BytesIO(b'ours'), work, prefix, limit=3)            with patch.object(source_release, 'archive_tree', side_effect=pack), \                 patch.object(store, 'upload', side_effect=racing_upload):                result = source_release.publish_archive(store, Path(temp), 'fixed-v1.json', {'schema': 1})        self.assertEqual(result, winner)        self.assertEqual(set(store.assets), {'winner.tar.zst', 'fixed-v1.json'})    def test_losing_publisher_cleans_up_when_index_arrives_during_payload_upload(self):        store = MemoryStore()        winner = {'schema': 1, 'parts': [{'name': 'winner.tar.zst'}]}        store.assets['winner.tar.zst'] = b'other publisher'        original_upload = store.upload        def racing_upload(path):            original_upload(path)            store.assets['fixed-v1.json'] = json.dumps(winner).encode()        with tempfile.TemporaryDirectory() as temp:            def pack(tree, work, prefix, exclude_gcc=False):                return source_release.split_stream(io.BytesIO(b'ours'), work, prefix)            with patch.object(source_release, 'archive_tree', side_effect=pack), \                 patch.object(store, 'upload', side_effect=racing_upload):                result = source_release.publish_archive(store, Path(temp), 'fixed-v1.json', {'schema': 1})        self.assertEqual(result, winner)        self.assertEqual(set(store.assets), {'winner.tar.zst', 'fixed-v1.json'})    def test_lost_index_upload_response_preserves_referenced_payload(self):        store = MemoryStore()        original_upload = store.upload        def upload_with_lost_response(path):            original_upload(path)            if path.name == 'fixed-v1.json':                raise RuntimeError('Response lost after server accepted index')        with tempfile.TemporaryDirectory() as temp:            def pack(tree, work, prefix, exclude_gcc=False):                return source_release.split_stream(io.BytesIO(b'ours'), work, prefix)            with patch.object(source_release, 'archive_tree', side_effect=pack), \                 patch.object(store, 'upload', side_effect=upload_with_lost_response):                result = source_release.publish_archive(store, Path(temp), 'fixed-v1.json', {'schema': 1})        self.assertEqual(store.assets[result['parts'][0]['name']], b'ours')        self.assertEqual(json.loads(store.assets['fixed-v1.json']), result)    def test_publisher_skips_upload_if_another_job_finishes_during_compression(self):        store = MemoryStore()        winner = {'schema': 1, 'parts': [{'name': 'winner.tar.zst'}]}        with tempfile.TemporaryDirectory() as temp:            def pack(tree, work, prefix, exclude_gcc=False):                parts = source_release.split_stream(io.BytesIO(b'ours'), work, prefix)                store.assets['fixed-v1.json'] = json.dumps(winner).encode()                return parts            with patch.object(source_release, 'archive_tree', side_effect=pack):                result = source_release.publish_archive(store, Path(temp), 'fixed-v1.json', {'schema': 1})        self.assertEqual(result, winner)        self.assertEqual(store.uploads, [])    def test_release_upload_does_not_allow_overwriting_existing_index(self):        store = source_release.ReleaseStore('owner/repo', 'source-toolchains')        with patch.object(store, 'ensure_release'), patch.object(store, 'gh') as gh:            store.upload(Path('gcc-v1.json'))        self.assertNotIn('--clobber', gh.call_args.args)    def test_comparison_archive_is_not_restored_as_a_verified_git_checkout(self):        store = MemoryStore()        metadata = {'schema': 1, 'locked': '<manifest/>', 'gcc_sha': '', 'git_metadata': False,                    'digest': source_release.manifest_digest('<manifest/>', '')}        store.assets['no-history.json'] = json.dumps(metadata).encode()        with self.assertRaisesRegex(ValueError, 'History-free comparison'):            source_release.restore_snapshot(store, MemoryStore(), 'no-history.json',                                            Path('unused'), Path('unused.xml'))    @unittest.skipUnless(os.name == 'posix' and shutil.which('zstd'), 'Requires Linux tar and zstd')    def test_history_free_archive_keeps_working_files_and_excludes_git_metadata(self):        with tempfile.TemporaryDirectory() as temp:            work = Path(temp)            root, output = work / 'source', work / 'packed'            output.mkdir()            for relative in ('.repo/objects/pack', 'common/.git/objects/pack',                             'vendor/nested/.git', 'common/.gitignore', 'common/source.c',                             'gcc/compiler'):                path = root / relative                path.parent.mkdir(parents=True, exist_ok=True)                path.write_text(relative)            script = root / 'common' / 'run'            script.write_text('#!/bin/sh\nexit 0\n')            script.chmod(0o755)            (root / 'common' / 'link').symlink_to('source.c')            parts = source_release.archive_tree(root, output, 'light', exclude_gcc=True,                                                exclude_history=True)            self.assertEqual(len(parts), 1)            restored = work / 'restored'            source_release.extract_archive(output / parts[0]['name'], restored)            self.assertFalse((restored / '.repo').exists())            self.assertFalse((restored / 'common' / '.git').exists())            self.assertFalse((restored / 'vendor' / 'nested' / '.git').exists())            self.assertFalse((restored / 'gcc').exists())            self.assertTrue((restored / 'common' / '.gitignore').exists())            self.assertTrue((restored / 'common' / 'source.c').exists())            self.assertTrue((restored / 'common' / 'link').is_symlink())            self.assertTrue((restored / 'common' / 'run').stat().st_mode & 0o111)    @unittest.skipUnless(os.name == 'posix' and shutil.which('zstd'), 'Requires Linux tar and zstd')    def test_real_archive_roundtrip_preserves_git_symlinks_and_executable_mode(self):        store, gcc_store = MemoryStore(), MemoryStore()        with tempfile.TemporaryDirectory() as temp:            work = Path(temp)            root = work / 'original'            for name in ('common', 'gcc'):                directory = root / name                directory.mkdir(parents=True)                (directory / 'payload').write_text(name)                if name == 'common':                    (directory / 'Makefile').write_text('SUBLEVEL = 123\n')                subprocess.run(['git', 'init', '-q', str(directory)], check=True)                subprocess.run(['git', '-C', str(directory), 'add', '.'], check=True)                subprocess.run(['git', '-C', str(directory), '-c', 'user.name=Test',                    '-c', 'user.email=test@example.com', 'commit', '-qm', 'fixture'], check=True)            script = root / 'common' / 'run'            script.write_text('#!/bin/sh\nexit 0\n')            script.chmod(0o755)            (root / 'common' / 'link').symlink_to('payload')            # Model repo's relative .git/object links, not only standalone clones.            git_dir = root / '.repo' / 'projects' / 'common.git'            git_dir.parent.mkdir(parents=True)            (root / 'common' / '.git').rename(git_dir)            (root / 'common' / '.git').symlink_to('../.repo/projects/common.git', target_is_directory=True)            object_dir = root / '.repo' / 'project-objects' / 'kernel' / 'common.git' / 'objects'            object_dir.parent.mkdir(parents=True)            (git_dir / 'objects').rename(object_dir)            (git_dir / 'objects').symlink_to('../../project-objects/kernel/common.git/objects', target_is_directory=True)            subprocess.run(['git', '--git-dir', str(git_dir), 'config', 'core.worktree',                            '../../../common'], check=True)            def head(path):                return subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD'], text=True).strip()            gcc_sha = head(root / 'gcc')            locked = '<manifest><project name="kernel/common" path="common" revision="' + head(root / 'common') + '"/></manifest>'            metadata = {'schema': 1, 'target': 'fixed', 'locked': locked, 'gcc_sha': gcc_sha,                        'digest': source_release.manifest_digest(locked, gcc_sha)}            source_release.publish_archive(gcc_store, root / 'gcc', f'gcc-{gcc_sha}-v1.json',                                           {'schema': 1, 'gcc_sha': gcc_sha})            source_release.publish_archive(store, root, 'fixed.json', metadata, exclude_gcc=True)            restored = work / 'restored'            source_release.restore_snapshot(store, gcc_store, 'fixed.json', restored,                                           work / 'locked.xml', metadata['digest'])            self.assertTrue((restored / 'common' / 'link').is_symlink())            self.assertTrue((restored / 'common' / '.git').is_symlink())            self.assertTrue((restored / 'common' / 'run').stat().st_mode & 0o111)            self.assertEqual((restored / 'gcc' / 'payload').read_text(), 'gcc')            self.assertEqual(head(restored / 'common'), head(root / 'common'))            self.assertEqual((work / 'locked.xml').read_text(), locked)            # Exercise the actual CLI and Bash fixed-version fast path with a            # filesystem-backed gh fixture. No Google/repo request is needed.            target = 'android13-5.15.123-2023-11-r9'            index = json.loads(store.assets['fixed.json'])            index['target'] = target            source_release.publish_snapshot(store, gcc_store, root, target + '-v1.json', index)            source_release.publish_snapshot(store, gcc_store, root, target + '-v1.json', index, include_history=True)            releases = work / 'releases'            for tag, memory in [('source-android13-5.15', store), ('source-toolchains', gcc_store)]:                folder = releases / tag                folder.mkdir(parents=True)                for name, data in memory.assets.items():                    (folder / name).write_bytes(data)            bin_dir = work / 'bin'            bin_dir.mkdir()            gh = bin_dir / 'gh'            gh.write_text('#!' + sys.executable + '\n' + '''import json, os, shutil, sysfrom pathlib import Patha = sys.argv[1:]releases = Path(os.environ['FAKE_RELEASES'])if a[0] == 'api':    if '/releases/tags/' in a[1]:        print(json.dumps({'id': a[1].rsplit('/', 1)[1]}))    elif '/releases/assets/' in a[1]:        asset_id = a[1].rsplit('/', 1)[1]        source = next(p for p in releases.glob('*/*')                      if p.parent.name + ':' + p.name == asset_id)        if os.environ.get('NO_PAYLOAD_DOWNLOAD') and not source.name.endswith('.json'):            raise SystemExit('Updater downloaded an existing payload')        with source.open('rb') as payload:            shutil.copyfileobj(payload, sys.stdout.buffer)    else:        tag = a[1].split('/releases/')[1].split('/')[0]        print(json.dumps([[{'name': p.name, 'size': p.stat().st_size,                            'id': tag + ':' + p.name} for p in (releases / tag).iterdir()]]))elif a[:2] == ['release', 'download']:    name = a[a.index('--pattern') + 1]    if os.environ.get('NO_PAYLOAD_DOWNLOAD') and not name.endswith('.json'):        raise SystemExit('Updater downloaded an existing payload')    destination = Path(a[a.index('--dir') + 1]) / name    shutil.copyfile(releases / a[2] / name, destination)elif a[:2] == ['release', 'upload']:    source = Path(a[3])    destination = releases / a[2] / source.name    if destination.exists():        raise SystemExit('Asset already exists')    shutil.copyfile(source, destination)else:    raise SystemExit('Unexpected GitHub operation: ' + repr(a))''')            gh.chmod(0o755)            workspace = work / 'workspace'            workspace.mkdir()            scripts = Path(__file__).resolve().parents[1] / 'scripts'            (workspace / 'scripts').symlink_to(scripts, target_is_directory=True)            runner_temp = work / 'runner'            runner_temp.mkdir()            environment = {**os.environ, 'PATH': str(bin_dir) + os.pathsep + os.environ['PATH'],                'FAKE_RELEASES': str(releases), 'GITHUB_WORKSPACE': str(workspace),                'GITHUB_REPOSITORY': 'owner/repo', 'RUNNER_TEMP': str(runner_temp),                'GITHUB_OUTPUT': str(work / 'outputs'), 'GITHUB_STEP_SUMMARY': str(work / 'summary'),                'SOURCE_ANDROID': 'android13', 'SOURCE_KERNEL': '5.15', 'SOURCE_SUBLEVEL': '123',                'SOURCE_PATCH': '2023-11', 'SOURCE_REVISION': 'r9', 'SOURCE_EPOCH': 'v1',                'SOURCE_UPDATE_ONLY': 'false'}            result = subprocess.run(['bash', str(scripts / 'source_release.sh')],                env=environment, text=True, capture_output=True)            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)            self.assertIn('hit=true', (work / 'outputs').read_text())            self.assertIn('digest=' + metadata['digest'], (work / 'outputs').read_text())            self.assertTrue((workspace / 'android13-5.15-123' / 'common' / 'link').is_symlink())            # Both runs restore the newly published default lightweight archive.            lightweight_index = releases / 'source-android13-5.15' / (target + '-v1.json')            self.assertTrue(lightweight_index.exists())            self.assertEqual(json.loads(lightweight_index.read_text())['git_seed_version'], 1)            shutil.rmtree(workspace / 'android13-5.15-123')            result = subprocess.run(['bash', str(scripts / 'source_release.sh')],                env=environment, text=True, capture_output=True)            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)            self.assertFalse((workspace / 'android13-5.15-123' / '.repo').exists())            self.assertTrue((workspace / 'android13-5.15-123' / 'common' / '.git').is_dir())            self.assertFalse((workspace / 'android13-5.15-123' / 'common' / '.git').is_symlink())            self.assertEqual(head(workspace / 'android13-5.15-123' / 'common'), head(root / 'common'))            environment.update(SOURCE_UPDATE_ONLY='true', NO_PAYLOAD_DOWNLOAD='true')            result = subprocess.run(['bash', str(scripts / 'source_release.sh')],                env=environment, text=True, capture_output=True)            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)            self.assertIn('skipping download', result.stdout)            # The checkbox opts back into the full-metadata index.            full_workspace = work / 'full-workspace'            full_workspace.mkdir()            (full_workspace / 'scripts').symlink_to(scripts, target_is_directory=True)            environment.update(GITHUB_WORKSPACE=str(full_workspace), SOURCE_UPDATE_ONLY='false',                               SOURCE_INCLUDE_HISTORY='true')            environment.pop('NO_PAYLOAD_DOWNLOAD')            result = subprocess.run(['bash', str(scripts / 'source_release.sh')],                env=environment, text=True, capture_output=True)            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)            self.assertTrue((full_workspace / 'android13-5.15-123' / '.repo').is_dir())if __name__ == '__main__':    unittest.main()
