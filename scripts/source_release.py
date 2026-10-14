@@ -137,13 +137,19 @@ class ReleaseStore:
 
     def read_metadata(self, name):
         safe_name(name)
-        with tempfile.TemporaryDirectory(prefix='source-index-') as directory:
-            path = Path(directory) / name
-            if not self.download(name, path, missing_ok=True):
-                return None
-            if path.stat().st_size > 4 * 1024 * 1024:
-                raise ValueError('Source index is unexpectedly large')
-            return json.loads(path.read_text(encoding='utf-8'))
+        asset = next((item for item in self.assets() if item['name'] == name), None)
+        if asset is None:
+            return None
+        if asset['size'] > 4 * 1024 * 1024:
+            raise ValueError('Source index is unexpectedly large')
+        print(f'Reading Release index into memory: {self.tag}/{name}', flush=True)
+        content = self.gh('api', f'repos/{self.repository}/releases/assets/{asset["id"]}',
+                          '--header', 'Accept: application/octet-stream', missing_ok=True)
+        if content is None:
+            return None
+        if len(content.encode('utf-8')) > 4 * 1024 * 1024:
+            raise ValueError('Source index is unexpectedly large')
+        return json.loads(content)
 
     def download(self, name, destination, missing_ok=False):
         safe_name(name)
@@ -444,11 +450,17 @@ def restore_snapshot(store, gcc_store, marker, root, locked_path, expected_diges
         raise ValueError('Source archive target does not match the requested version')
     gcc_sha = metadata['gcc_sha']
     gcc_index = metadata.get('gcc_index', f'gcc-{gcc_sha}-v1.json')
-    gcc = gcc_store.read_metadata(gcc_index) if gcc_sha else None
-    if gcc_sha and (gcc is None or gcc.get('gcc_sha') != gcc_sha):
-        print('GCC archive missing; source synchronization is required')
-        return None
+
+    def read_gcc_metadata():
+        gcc = gcc_store.read_metadata(gcc_index)
+        if gcc is None or gcc.get('gcc_sha') != gcc_sha:
+            print('GCC archive missing; source synchronization is required', flush=True)
+            return None
+        return gcc
+
     if metadata_only:
+        if gcc_sha and read_gcc_metadata() is None:
+            return None
         print(f'Complete Release archive already exists: {marker}; skipping download')
         return metadata
     # Extract and verify in isolation before replacing the initialized checkout.
@@ -457,14 +469,21 @@ def restore_snapshot(store, gcc_store, marker, root, locked_path, expected_diges
         work = Path(directory)
         staging = work / 'checkout'
         staging.mkdir()
-        print('Restoring source and GCC with parallel download/extraction pipelines', flush=True)
+
+        def restore_gcc():
+            gcc = read_gcc_metadata()
+            if gcc is not None:
+                restore_archive(gcc_store, gcc['parts'], staging / 'gcc', work)
+            return gcc
+
+        print('Source index ready; starting source restore alongside GCC index/restore', flush=True)
         with ThreadPoolExecutor(max_workers=2) as pool:
             source_restore = pool.submit(restore_archive, store, metadata['parts'], staging, work)
-            gcc_restore = pool.submit(restore_archive, gcc_store, gcc['parts'], staging / 'gcc', work) \
-                if gcc_sha else None
+            gcc_restore = pool.submit(restore_gcc) if gcc_sha else None
             source_restore.result()
-            if gcc_restore is not None:
-                gcc_restore.result()
+            gcc = gcc_restore.result() if gcc_restore is not None else None
+        if gcc_sha and gcc is None:
+            return None
         if metadata.get('git_metadata') is False:
             restore_seed_bundle(staging)
         if gcc_sha:
