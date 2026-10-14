@@ -51,6 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+      gcc_sha: ${{ steps.gcc.outputs.gcc_sha }}
     steps:
       - uses: actions/checkout@v6
       - name: 读取现有版本配置
@@ -80,8 +81,21 @@ jobs:
               raise SystemExit(f'Invalid source matrix size: {len(matrix)}')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('matrix=' + json.dumps(matrix, separators=(',', ':')) + '\n')
+              output.write('has_gcc=' + str(any(target['kernel_version'] in ('5.10', '5.15') for target in matrix)).lower() + '\n')
           print(json.dumps(matrix, indent=2))
           PY
+      - name: 准备 GCC 归档工具
+        if: steps.matrix.outputs.has_gcc == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
+      - name: 检查并准备共享 GCC（5.10 / 5.15）
+        id: gcc
+        if: steps.matrix.outputs.has_gcc == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_INCLUDE_HISTORY: ${{ inputs.include_history && 'true' || 'false' }}
+        run: python3 scripts/prepare_gcc_release.py
 
   archive:
     name: 源码 ${{ matrix.android_version }}-${{ matrix.kernel_version }}.${{ matrix.sub_level }}-${{ matrix.os_patch_level }}${{ matrix.revision && format('-{0}', matrix.revision) || '' }}
@@ -90,7 +104,6 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      max-parallel: 2
       matrix:
         include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
@@ -117,3 +130,4 @@ jobs:
           cache_epoch: ${{ inputs.cache_epoch || 'v1' }}
           update_only: 'true'
           include_history: ${{ inputs.include_history && 'true' || 'false' }}
+          gcc_sha: ${{ needs.prepare.outputs.gcc_sha }}

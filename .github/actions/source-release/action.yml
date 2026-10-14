@@ -25,6 +25,9 @@ inputs:
   include_history:
     default: 'false'
     description: Opt in to full Git metadata; unchecked uses history-free source archives
+  gcc_sha:
+    default: ''
+    description: Shared GCC commit pinned by the source update preparation job
 outputs:
   digest:
     description: SHA256 of the full locked source manifest and GCC revision
@@ -47,4 +50,5 @@ runs:
         SOURCE_EPOCH: ${{ inputs.cache_epoch }}
         SOURCE_UPDATE_ONLY: ${{ inputs.update_only }}
         SOURCE_INCLUDE_HISTORY: ${{ inputs.include_history }}
+        SOURCE_GCC_SHA: ${{ inputs.gcc_sha }}
       run: bash "$GITHUB_WORKSPACE/scripts/source_release.sh"

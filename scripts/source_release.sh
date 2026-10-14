@@ -103,7 +103,10 @@ fi
 "$repo" manifest -o "$RUNNER_TEMP/source-manifest.xml"
 gcc_sha=""
 if [[ "$SOURCE_KERNEL" == 5.10 || "$SOURCE_KERNEL" == 5.15 ]]; then
-  gcc_sha=$(retry git ls-remote https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git HEAD | awk '{print $1}')
+  gcc_sha="${SOURCE_GCC_SHA:-}"
+  if [ -z "$gcc_sha" ]; then
+    gcc_sha=$(retry git ls-remote https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git HEAD | awk '{print $1}')
+  fi
   if [[ ! "$gcc_sha" =~ ^[a-fA-F0-9]{40}$ ]]; then
     echo "::error::无法锁定额外 GCC 工具链提交" >&2
     exit 1
