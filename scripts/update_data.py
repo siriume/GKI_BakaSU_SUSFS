@@ -62,6 +62,13 @@ def update_target(android_ver: str, kernel_ver: str,
                     continue
                 text = fetch_makefile(android_ver, kernel_ver, date, dep_cutoff)
                 if text is None:
+                    # The current month's branch may appear before its Makefile is
+                    # published. Treat that as an incomplete month only when there
+                    # is no existing entry to update; missing historical data stays
+                    # fatal so the updater cannot silently drop a known release.
+                    if date == end and current is None:
+                        print(f"  [{date}] monthly branch has no Makefile yet, skip")
+                        continue
                     raise RuntimeError(f"monthly branch has no Makefile: {android_ver}-{kernel_ver}-{date}")
             else:
                 text = fetch_tag_makefile(*release)
