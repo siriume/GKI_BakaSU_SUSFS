@@ -79,6 +79,8 @@ Fork 仓库只生成 Actions 产物，不会向上游仓库发布 Release。
 
 首次使用可先手动运行该工作流，为所需分组准备归档。详细命名、分卷和刷新规则见 [源码归档说明](docs/source-releases.md)。
 
+若要比较去掉 Git 历史后的大小，手动运行时勾选 `compare_without_history`，会另存 `no-history` 源码/GCC 包，并在 Summary 显示压缩体积差异。
+
 ## BakaSU 分支
 
 `kernelsu_branch` 留空时使用 `main`。也可以填写 BakaSU 的远程分支名，或完整的 40 位 commit SHA。工作流会在构建开始时解析并固定该分支对应的提交，因此同一次运行的各个 KMI 使用相同代码；发布说明会链接到实际构建的 BakaSU 提交。

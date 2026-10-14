@@ -27,8 +27,13 @@ class MemoryStore:
         destination.write_bytes(self.assets[name])
 
     def upload(self, path):
+        if path.name in self.assets:
+            raise RuntimeError('Asset already exists')
         self.uploads.append(path.name)
         self.assets[path.name] = path.read_bytes()
+
+    def delete_asset(self, name):
+        self.assets.pop(name, None)
 
 
 class SourceReleaseTests(unittest.TestCase):
@@ -64,6 +69,14 @@ class SourceReleaseTests(unittest.TestCase):
             store.assets[parts[0]['name']] = b'xxxx'
             with self.assertRaisesRegex(ValueError, 'checksum'):
                 source_release.assemble_parts(store, parts, output)
+
+    def test_single_file_has_no_part_suffix_including_exact_limit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            for data in (b'123', b'1234'):
+                parts = source_release.split_stream(io.BytesIO(data), work, 'single', limit=4)
+                self.assertEqual([p['name'] for p in parts], ['single.tar.zst'])
+                self.assertEqual((work / 'single.tar.zst').read_bytes(), data)
 
     def test_reject_download_paths_outside_archive_directory(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -129,6 +142,143 @@ class SourceReleaseTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     source_release.publish_archive(store, root, 'fixed-v1.json', {'schema': 1})
             self.assertNotIn('fixed-v1.json', store.assets)
+
+    def test_losing_publisher_removes_only_its_own_payloads(self):
+        store = MemoryStore()
+        winner = {'schema': 1, 'parts': [{'name': 'winner.tar.zst'}]}
+        store.assets['winner.tar.zst'] = b'other publisher'
+        original_upload = store.upload
+        def racing_upload(path):
+            if path.name == 'fixed-v1.json':
+                # The other publisher wins between our final read and upload.
+                store.assets[path.name] = json.dumps(winner).encode()
+                raise RuntimeError('Asset already exists')
+            original_upload(path)
+        with tempfile.TemporaryDirectory() as temp:
+            def pack(tree, work, prefix, exclude_gcc=False):
+                return source_release.split_stream(io.BytesIO(b'ours'), work, prefix, limit=3)
+            with patch.object(source_release, 'archive_tree', side_effect=pack), \
+                 patch.object(store, 'upload', side_effect=racing_upload):
+                result = source_release.publish_archive(store, Path(temp), 'fixed-v1.json', {'schema': 1})
+        self.assertEqual(result, winner)
+        self.assertEqual(set(store.assets), {'winner.tar.zst', 'fixed-v1.json'})
+
+    def test_losing_publisher_cleans_up_when_index_arrives_during_payload_upload(self):
+        store = MemoryStore()
+        winner = {'schema': 1, 'parts': [{'name': 'winner.tar.zst'}]}
+        store.assets['winner.tar.zst'] = b'other publisher'
+        original_upload = store.upload
+        def racing_upload(path):
+            original_upload(path)
+            store.assets['fixed-v1.json'] = json.dumps(winner).encode()
+        with tempfile.TemporaryDirectory() as temp:
+            def pack(tree, work, prefix, exclude_gcc=False):
+                return source_release.split_stream(io.BytesIO(b'ours'), work, prefix)
+            with patch.object(source_release, 'archive_tree', side_effect=pack), \
+                 patch.object(store, 'upload', side_effect=racing_upload):
+                result = source_release.publish_archive(store, Path(temp), 'fixed-v1.json', {'schema': 1})
+        self.assertEqual(result, winner)
+        self.assertEqual(set(store.assets), {'winner.tar.zst', 'fixed-v1.json'})
+
+    def test_lost_index_upload_response_preserves_referenced_payload(self):
+        store = MemoryStore()
+        original_upload = store.upload
+        def upload_with_lost_response(path):
+            original_upload(path)
+            if path.name == 'fixed-v1.json':
+                raise RuntimeError('Response lost after server accepted index')
+        with tempfile.TemporaryDirectory() as temp:
+            def pack(tree, work, prefix, exclude_gcc=False):
+                return source_release.split_stream(io.BytesIO(b'ours'), work, prefix)
+            with patch.object(source_release, 'archive_tree', side_effect=pack), \
+                 patch.object(store, 'upload', side_effect=upload_with_lost_response):
+                result = source_release.publish_archive(store, Path(temp), 'fixed-v1.json', {'schema': 1})
+        self.assertEqual(store.assets[result['parts'][0]['name']], b'ours')
+        self.assertEqual(json.loads(store.assets['fixed-v1.json']), result)
+
+    def test_publisher_skips_upload_if_another_job_finishes_during_compression(self):
+        store = MemoryStore()
+        winner = {'schema': 1, 'parts': [{'name': 'winner.tar.zst'}]}
+        with tempfile.TemporaryDirectory() as temp:
+            def pack(tree, work, prefix, exclude_gcc=False):
+                parts = source_release.split_stream(io.BytesIO(b'ours'), work, prefix)
+                store.assets['fixed-v1.json'] = json.dumps(winner).encode()
+                return parts
+            with patch.object(source_release, 'archive_tree', side_effect=pack):
+                result = source_release.publish_archive(store, Path(temp), 'fixed-v1.json', {'schema': 1})
+        self.assertEqual(result, winner)
+        self.assertEqual(store.uploads, [])
+
+    def test_release_upload_does_not_allow_overwriting_existing_index(self):
+        store = source_release.ReleaseStore('owner/repo', 'source-toolchains')
+        with patch.object(store, 'ensure_release'), patch.object(store, 'gh') as gh:
+            store.upload(Path('gcc-v1.json'))
+        self.assertNotIn('--clobber', gh.call_args.args)
+
+    def test_history_free_comparison_includes_source_and_shared_gcc_sizes(self):
+        store, gcc_store = MemoryStore(), MemoryStore()
+        gcc_sha = 'a' * 40
+        original = {'schema': 1, 'target': 'fixed', 'locked': '<manifest/>',
+                    'gcc_sha': gcc_sha, 'digest': source_release.manifest_digest('<manifest/>', gcc_sha),
+                    'parts': [{'name': 'source.tar.zst', 'size': 100}]}
+        store.assets['fixed-v1.json'] = json.dumps(original).encode()
+        gcc_store.assets[f'gcc-{gcc_sha}-v1.json'] = json.dumps({
+            'schema': 1, 'gcc_sha': gcc_sha, 'parts': [{'name': 'gcc.tar.zst', 'size': 80}]
+        }).encode()
+        with tempfile.TemporaryDirectory() as temp:
+            def pack(tree, work, prefix, exclude_gcc=False, exclude_history=False):
+                self.assertTrue(exclude_history)
+                return source_release.split_stream(io.BytesIO(b'lightweight'), work, prefix)
+            with patch.object(source_release, 'archive_tree', side_effect=pack), \
+                 patch.object(source_release, 'verify_checkout'), \
+                 patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': str(Path(temp) / 'summary')}):
+                sizes = source_release.compare_without_history(store, gcc_store, 'fixed-v1.json', Path(temp))
+                self.assertIn('减少 87.78%', (Path(temp) / 'summary').read_text(encoding='utf-8'))
+        self.assertEqual(sizes['original_bytes'], 180)
+        self.assertEqual(sizes['without_history_bytes'], 22)
+        self.assertIn('fixed-v1-no-history.json', store.assets)
+        self.assertIn(f'gcc-{gcc_sha}-v1-no-history.json', gcc_store.assets)
+        self.assertFalse(json.loads(store.assets['fixed-v1-no-history.json'])['git_metadata'])
+        self.assertEqual(json.loads(store.assets['fixed-v1.json']), original)
+
+    def test_comparison_archive_is_not_restored_as_a_verified_git_checkout(self):
+        store = MemoryStore()
+        metadata = {'schema': 1, 'locked': '<manifest/>', 'gcc_sha': '', 'git_metadata': False,
+                    'digest': source_release.manifest_digest('<manifest/>', '')}
+        store.assets['no-history.json'] = json.dumps(metadata).encode()
+        with self.assertRaisesRegex(ValueError, 'History-free comparison'):
+            source_release.restore_snapshot(store, MemoryStore(), 'no-history.json',
+                                            Path('unused'), Path('unused.xml'))
+
+    @unittest.skipUnless(os.name == 'posix' and shutil.which('zstd'), 'Requires Linux tar and zstd')
+    def test_history_free_archive_keeps_working_files_and_excludes_git_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            root, output = work / 'source', work / 'packed'
+            output.mkdir()
+            for relative in ('.repo/objects/pack', 'common/.git/objects/pack',
+                             'vendor/nested/.git', 'common/.gitignore', 'common/source.c',
+                             'gcc/compiler'):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(relative)
+            script = root / 'common' / 'run'
+            script.write_text('#!/bin/sh\nexit 0\n')
+            script.chmod(0o755)
+            (root / 'common' / 'link').symlink_to('source.c')
+            parts = source_release.archive_tree(root, output, 'light', exclude_gcc=True,
+                                                exclude_history=True)
+            self.assertEqual(len(parts), 1)
+            restored = work / 'restored'
+            source_release.extract_archive(output / parts[0]['name'], restored)
+            self.assertFalse((restored / '.repo').exists())
+            self.assertFalse((restored / 'common' / '.git').exists())
+            self.assertFalse((restored / 'vendor' / 'nested' / '.git').exists())
+            self.assertFalse((restored / 'gcc').exists())
+            self.assertTrue((restored / 'common' / '.gitignore').exists())
+            self.assertTrue((restored / 'common' / 'source.c').exists())
+            self.assertTrue((restored / 'common' / 'link').is_symlink())
+            self.assertTrue((restored / 'common' / 'run').stat().st_mode & 0o111)
 
     @unittest.skipUnless(os.name == 'posix' and shutil.which('zstd'), 'Requires Linux tar and zstd')
     def test_real_archive_roundtrip_preserves_git_symlinks_and_executable_mode(self):
@@ -208,7 +358,7 @@ if a[0] == 'api':
         print(json.dumps([[{'name': p.name} for p in (releases / tag).iterdir()]]))
 elif a[:2] == ['release', 'download']:
     name = a[a.index('--pattern') + 1]
-    if os.environ.get('NO_PAYLOAD_DOWNLOAD') and '.part' in name:
+    if os.environ.get('NO_PAYLOAD_DOWNLOAD') and not name.endswith('.json'):
         raise SystemExit('Updater downloaded an existing payload')
     destination = Path(a[a.index('--dir') + 1]) / name
     shutil.copyfile(releases / a[2] / name, destination)

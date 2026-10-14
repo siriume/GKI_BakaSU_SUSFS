@@ -76,6 +76,8 @@ class ReleaseStore:
                 return result.stdout
             if missing_ok and 'HTTP 404' in result.stderr:
                 return None
+            if 'already_exists' in result.stderr or 'already exists' in result.stderr:
+                break
             if attempt < 2:
                 time.sleep(3 * (attempt + 1))
         raise RuntimeError(f'GitHub Release operation failed: {result.stderr.strip()}')
@@ -84,15 +86,18 @@ class ReleaseStore:
         text = self.gh('api', f'repos/{self.repository}/releases/tags/{self.tag}', missing_ok=True)
         return json.loads(text) if text is not None else None
 
-    def read_metadata(self, name):
-        safe_name(name)
+    def assets(self):
         release = self.release()
         if release is None:
-            return None
+            return []
         pages = json.loads(self.gh('api',
             f'repos/{self.repository}/releases/{release["id"]}/assets?per_page=100',
             '--paginate', '--slurp'))
-        if not any(asset['name'] == name for page in pages for asset in page):
+        return [asset for page in pages for asset in page]
+
+    def read_metadata(self, name):
+        safe_name(name)
+        if not any(asset['name'] == name for asset in self.assets()):
             return None
         with tempfile.TemporaryDirectory(prefix='source-index-') as directory:
             path = Path(directory) / name
@@ -125,7 +130,17 @@ class ReleaseStore:
 
     def upload(self, path):
         self.ensure_release()
-        self.gh('release', 'upload', self.tag, str(path), '--repo', self.repository, '--clobber')
+        # In particular, completion indexes must be create-only: a concurrent
+        # publisher must not replace the winner's index after reading a miss.
+        self.gh('release', 'upload', self.tag, str(path), '--repo', self.repository)
+
+    def delete_asset(self, name):
+        safe_name(name)
+        for asset in self.assets():
+            if asset['name'] == name:
+                self.gh('api', '--method', 'DELETE',
+                        f'repos/{self.repository}/releases/assets/{asset["id"]}', missing_ok=True)
+                return
 
 
 def split_stream(stream, work, prefix, limit=PART_LIMIT):
@@ -149,13 +164,21 @@ def split_stream(stream, work, prefix, limit=PART_LIMIT):
         parts.append({'name': name, 'size': size, 'sha256': checksum.hexdigest()})
     if not parts:
         raise ValueError('Refusing to publish an empty archive')
+    if len(parts) == 1:
+        name = safe_name(f'{prefix}.tar.zst')
+        (work / parts[0]['name']).replace(work / name)
+        parts[0]['name'] = name
     return parts
 
 
-def archive_tree(root, work, prefix, exclude_gcc=False):
+def archive_tree(root, work, prefix, exclude_gcc=False, exclude_history=False):
     command = ['tar', '-C', str(root)]
     if exclude_gcc:
         command += ['--exclude=./gcc']
+    if exclude_history:
+        # Match metadata directories, .git files and .git symlinks at any depth.
+        # Keep ordinary versioned files such as .gitignore and .gitmodules.
+        command += ['--exclude=.repo', '--exclude=.git']
     command += ['-cf', '-', '.']
     # Never print binary archive data. Both subprocesses must finish successfully.
     with subprocess.Popen(command, stdout=subprocess.PIPE) as tar:
@@ -205,7 +228,20 @@ def assemble_parts(store, parts, output):
                 path.unlink(missing_ok=True)
 
 
-def publish_archive(store, root, marker, metadata, exclude_gcc=False):
+def discard_unreferenced_uploads(store, parts, winner):
+    """Delete only this attempt's unique payloads not referenced by the index."""
+    referenced = {part['name'] for part in winner['parts']}
+    for part in parts:
+        if part['name'] not in referenced:
+            try:
+                store.delete_asset(part['name'])
+                print(f'Removed redundant upload: {part["name"]}', flush=True)
+            except (RuntimeError, OSError) as error:
+                # The winning archive remains usable even if cleanup is denied.
+                print(f'Could not remove redundant upload {part["name"]}: {error}', file=sys.stderr)
+
+
+def publish_archive(store, root, marker, metadata, exclude_gcc=False, exclude_history=False):
     existing = store.read_metadata(marker)
     if existing is not None:
         return existing
@@ -220,24 +256,91 @@ def publish_archive(store, root, marker, metadata, exclude_gcc=False):
         if metadata.get('digest') and metadata['digest'] not in prefix:
             prefix += '-' + metadata['digest'][:16]
         prefix += '-' + uuid.uuid4().hex[:12]
-        parts = archive_tree(root, work, prefix, exclude_gcc)
+        if exclude_history:
+            parts = archive_tree(root, work, prefix, exclude_gcc, exclude_history=True)
+        else:
+            parts = archive_tree(root, work, prefix, exclude_gcc)
+        # Compression can take minutes; avoid uploading if another job finished
+        # publishing the same target while we were packing it.
+        existing = store.read_metadata(marker)
+        if existing is not None:
+            return existing
         for part in parts:
             print(f'Uploading {part["name"]} ({part["size"] / 1024**2:.1f} MiB)', flush=True)
             store.upload(work / part['name'])
             (work / part['name']).unlink()
         existing = store.read_metadata(marker)
         if existing is not None:
+            discard_unreferenced_uploads(store, parts, existing)
             return existing
         metadata = {**metadata, 'parts': parts}
         path = work / marker
         path.write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
-        store.upload(path)
+        try:
+            store.upload(path)
+        except RuntimeError:
+            # The API atomically rejects a duplicate index name. Also handle a
+            # lost success response: never delete payloads the index references.
+            winner = store.read_metadata(marker)
+            if winner is None:
+                raise
+            discard_unreferenced_uploads(store, parts, winner)
+            return winner
         return metadata
 
 
 def extract_archive(archive, destination):
     destination.mkdir(parents=True, exist_ok=True)
     subprocess.run(['tar', '--zstd', '-xf', str(archive), '-C', str(destination)], check=True)
+
+
+def compare_without_history(store, gcc_store, marker, root):
+    original = store.read_metadata(marker)
+    if original is None:
+        raise ValueError('Create the original pristine archive before comparing its size')
+    validate_identity(original)
+    verify_checkout(original['locked'], root, original['gcc_sha'])
+    # Separate indexes keep the experiment independent of verified Git restores.
+    light_marker = marker.removesuffix('.json') + '-no-history.json'
+    light_metadata = {key: value for key, value in original.items() if key != 'parts'}
+    light_metadata.update(git_metadata=False, comparison_of=marker)
+    rows = []
+    gcc_sha = original['gcc_sha']
+    if gcc_sha:
+        gcc_marker = f'gcc-{gcc_sha}-v1.json'
+        gcc_original = gcc_store.read_metadata(gcc_marker)
+        if gcc_original is None or gcc_original.get('gcc_sha') != gcc_sha:
+            raise ValueError('Original GCC archive is missing or mismatched')
+        gcc_light_marker = f'gcc-{gcc_sha}-v1-no-history.json'
+        gcc_light = publish_archive(gcc_store, root / 'gcc', gcc_light_marker,
+            {'schema': 1, 'gcc_sha': gcc_sha, 'git_metadata': False, 'comparison_of': gcc_marker},
+            exclude_history=True)
+        light_metadata['gcc_index'] = gcc_light_marker
+        rows.append(('额外 GCC', gcc_original, gcc_light))
+    light = publish_archive(store, root, light_marker, light_metadata,
+                            exclude_gcc=True, exclude_history=True)
+    rows.insert(0, ('源码及 manifest 工具链', original, light))
+    totals = {'original_bytes': 0, 'without_history_bytes': 0}
+    lines = ['### 无 Git 历史归档大小对比', '',
+             '格式均为 tar.zst，压缩级别均为 zstd -6。锁定 manifest 保存在 JSON 索引中。', '']
+    for label, full, stripped in rows:
+        full_size = sum(part['size'] for part in full['parts'])
+        light_size = sum(part['size'] for part in stripped['parts'])
+        totals['original_bytes'] += full_size
+        totals['without_history_bytes'] += light_size
+        lines.append(f'- {label}：含 Git 元数据 {full_size / 1024**2:.2f} MiB → '
+                     f'无 Git 元数据 {light_size / 1024**2:.2f} MiB')
+    full_size, light_size = totals['original_bytes'], totals['without_history_bytes']
+    saving = (1 - light_size / full_size) * 100 if full_size else 0
+    lines += [f'- 合计：{full_size / 1024**2:.2f} MiB → {light_size / 1024**2:.2f} MiB，'
+              f'减少 {saving:.2f}%', '', f'无历史源码索引：`{light_marker}`', '']
+    report = '\n'.join(lines)
+    print(report, flush=True)
+    summary = os.environ.get('GITHUB_STEP_SUMMARY')
+    if summary:
+        with open(summary, 'a', encoding='utf-8') as output:
+            output.write(report + '\n')
+    return totals
 
 
 def restore_snapshot(store, gcc_store, marker, root, locked_path, expected_digest='',
@@ -247,6 +350,8 @@ def restore_snapshot(store, gcc_store, marker, root, locked_path, expected_diges
         print(f'Release archive not found: {store.tag if isinstance(store, ReleaseStore) else "test"}/{marker}')
         return None
     validate_identity(metadata, expected_digest)
+    if metadata.get('git_metadata') is False:
+        raise ValueError('History-free comparison archives cannot be restored as verified Git checkouts')
     if expected_target and metadata.get('target') != expected_target:
         raise ValueError('Source archive target does not match the requested version')
     gcc_sha = metadata['gcc_sha']
@@ -294,7 +399,7 @@ def write_outputs(**values):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['restore', 'save', 'names', 'restore-gcc'])
+    parser.add_argument('command', choices=['restore', 'save', 'names', 'restore-gcc', 'compare'])
     parser.add_argument('--android', required=True)
     parser.add_argument('--kernel', required=True)
     parser.add_argument('--sublevel', required=True)
@@ -338,6 +443,9 @@ def main():
             print('Restored shared GCC toolchain from Release')
         return
     marker = index_name(target, args.epoch, args.digest)
+    if args.command == 'compare':
+        compare_without_history(store, gcc_store, marker, args.root)
+        return
     if args.command == 'restore':
         metadata = restore_snapshot(store, gcc_store, marker, args.root, args.locked,
                                     args.digest if args.patch == 'lts' else '',
