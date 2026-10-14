@@ -38,6 +38,13 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: 准备并发下载工具
+      shell: bash
+      run: |
+        if ! command -v aria2c >/dev/null 2>&1; then
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends aria2
+        fi
     - name: 从 Release 获取或更新源码
       id: snapshot
       shell: bash
